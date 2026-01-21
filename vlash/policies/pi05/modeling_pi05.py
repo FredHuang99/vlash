@@ -163,7 +163,7 @@ class PI05SuffixEmbedder(nn.Module):
         Args:
             state: Robot state [B, state_dim].
             noisy_actions: Noisy action sequence x_t [B, T, action_dim].
-            time: Flow matching timestep [B].
+            time: Flow matching timestep [B], or [B, T] for per-token.
             
         Returns:
             suffix_embs: Action embeddings [B, T, D].
@@ -171,14 +171,33 @@ class PI05SuffixEmbedder(nn.Module):
             att_masks: Attention masks [B, T].
             adarms_cond: Conditioning signal for adaRMS [B, D].
         """
+        # 1. 兼容性处理：如果 time 是 [B]，扩展成 [B, 1] 以便广播，或者保持原样取决于 create_sinusoidal 实现
+        # 假设 create_sinusoidal_pos_embedding 只支持 [B] 或 [N]，我们需要处理形状
         # Create sinusoidal time embedding
-        time_emb = create_sinusoidal_pos_embedding(
-            time,
-            self.config.action_expert_config.hidden_size,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=time.device,
-        )
+        bsz, seq_len, _ = noisy_actions.shape
+        if time.dim() == 1:  # [B] -> [B, 1, D] broadcast later
+            time_emb = create_sinusoidal_pos_embedding(
+                time,
+                self.config.action_expert_config.hidden_size,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=time.device,
+            )
+            # time_emb shape is [B, D] -> unsqueeze to [B, 1, D]
+            time_emb = time_emb.unsqueeze(1)
+        else:
+            # [B, T] -> Flatten to calculate emb -> Reshape back
+            time_flat = time.view(-1)
+            time_emb_flat = create_sinusoidal_pos_embedding(
+                time_flat,
+                self.config.action_expert_config.hidden_size,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=time.device,
+            )
+            # Reshape back to [B, T, D]
+            time_emb = time_emb_flat.view(bsz, seq_len, -1)
+        
         time_emb = time_emb.to(dtype=time.dtype)
         
         # Process time through MLP
@@ -773,16 +792,59 @@ class PI05Model(nn.Module):
         Returns:
             Per-element MSE loss [B, T, action_dim].
         """
+        # 1. 采样 Noise (保持不变)
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
+        
+        # ================== Training-Time RTC 修改开始 ==================
 
+        bsz, chunk_size, action_dim = actions.shape
+        device = actions.device
+
+        # 2. 采样 Time (t)
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            # 原始逻辑：scalar time [B]
+            time = self.sample_time(actions.shape[0], device) # actions.device
+
+            # --- 新增逻辑：扩展 time 到 [B, T] ---
+            # 这里的 T 就是 chunk_size
+            time = time.unsqueeze(1).expand(bsz, chunk_size) # [B, T]
+
+        # 3. 采样 Delay (d)
+        # 假设 max_delay_steps 在 config 里，或者硬编码，例如 10
+        max_delay = getattr(self.config, "max_delay_steps", 0)
+        
+        if max_delay > 0:
+            # 随机采样每个样本的 delay: [0, max_delay]
+            delays = torch.randint(0, max_delay + 1, (bsz,), device=device)
+            
+            # 创建 Prefix Mask: [B, T]
+            # range_tensor: [0, 1, 2, ..., T-1]
+            range_tensor = torch.arange(chunk_size, device=device).unsqueeze(0)
+            # mask[b, t] is True if t < delay[b]
+            prefix_mask = range_tensor < delays.unsqueeze(1)
+            
+            # 4. 修改 Time (Rewriting)
+            # 对 prefix 部分，强制 set time = 0.0 (Data/Clean Actions)
+            # 注意：VLASH 中 t=0 是数据，t=1 是噪声
+            time = torch.where(prefix_mask, torch.zeros_like(time), time)
+        else:
+            prefix_mask = None
 
         # Interpolate between noise and actions
-        time_expanded = time[:, None, None]
+        # time_expanded = time[:, None, None]
+        # 5. Flow Matching 插值 (Interpolation)
+        # time 现在是 [B, T]，需要扩展维度匹配 action [B, T, D]
+        time_expanded = time.unsqueeze(-1) # [B, T, 1]
+        
+        # x_t 计算会自动处理：
+        # 当 t=0 (prefix) 时: x_t = 0*noise + 1*actions = actions (Clean)
+        # 当 t>0 (suffix) 时: x_t = t*noise + (1-t)*actions (Noisy)
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        # True velocity u_t
         u_t = noise - actions  # True velocity
+
+        # ================== Training-Time RTC 修改结束 ==================
 
         # Embed prefix (images + language)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
@@ -829,7 +891,26 @@ class PI05Model(nn.Module):
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # 6. 计算 Loss
+        # F.mse_loss with reduction='none' 返回 [B, T, D]
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+
+        # ================== Training-Time RTC Loss Masking ==================
+        if prefix_mask is not None:
+            # 对 Prefix 部分的 Loss 乘以 0 (Mask 掉)
+            # prefix_mask is [B, T], losses is [B, T, D]
+            loss_mask = (~prefix_mask).unsqueeze(-1).float()
+            losses = losses * loss_mask
+            
+            # 归一化时要注意只除以有效元素的个数
+            # sum(losses) / count(valid_elements)
+            # 也可以简单用 mean()，但会偏小；通常建议做一下 valid count
+            # 这里简单演示修改 mean 的逻辑：
+            # return losses.sum() / (loss_mask.sum() * action_dim + 1e-6)
+        # ===================================================================
+
+        return losses # 返回给外层 wrapper 处理 mean()
+        #return F.mse_loss(u_t, v_t, reduction="none")
 
     def forward_shared_observation(
         self,

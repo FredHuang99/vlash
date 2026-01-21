@@ -4,7 +4,7 @@
 # Policy configuration
 policy:
   type: pi05
-  pretrained_path: lerobot/pi05_base
+  pretrained_path: lerobot/pi05_base # download to local
   push_to_hub: false
   dtype: bfloat16
   device: cuda
@@ -12,11 +12,11 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: <your dataset repository id>
+  repo_id: <your dataset repository id> # download to local
   video_backend: torchcodec
 
 # Training parameters
-output_dir: outputs/train/pi05_async_lora
+output_dir: outputs/train/pi05_async_lora # change to your desired output directory
 job_name: pi05_async_lora
 batch_size: 1
 grad_accum_steps: 8  # Effective batch size per optimizer step: 1 x 8 = 8

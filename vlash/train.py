@@ -110,6 +110,15 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
     )
     
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+
+    # 【关键修改】
+    # 我们希望 Dataset 返回 "t ~ t+chunk" 的干净数据，不要做任何位移或 State 替换。
+    # 所以这里强制传 0 给 dataset。
+    # 真正的 random delay logic 会移到 model.forward 里去（正如上一轮回答中修改 modeling_pi05.py 那样）。
+    dataset_delay_steps = 0 
+    
+    # 注意：你需要确保 model config 里依然拿着真正的 cfg.max_delay_steps
+    # 这一步通常在 make_policy 里已经处理了，因为 cfg.policy 是整个传进去的
     
     # Determine which dataset class to use
     if cfg.shared_observation and cfg.max_delay_steps > 0:
@@ -117,6 +126,12 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             f"Creating SharedObservationVLASHDataset with max_delay_steps={cfg.max_delay_steps} "
             f"(training all offsets [0, {cfg.max_delay_steps}] with shared observation)"
         )
+        
+        # Create dataset with temporal offset augmentation
+        # 如果你用了 TT-RTC，其实就不需要 SharedObservation 了
+        # 因为数据不再变长，也没有多个 Offset，每个 Batch 都是规整的
+        # 所以这里可以简化，直接强制走 else 分支，或者仅仅为了兼容性：
+        logging.warning("TT-RTC enabled: Forcing Dataset to align mode (max_delay_steps=0).")
         dataset = SharedObservationVLASHDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
@@ -125,7 +140,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
-            max_delay_steps=cfg.max_delay_steps,
+            max_delay_steps=dataset_delay_steps,# cfg.max_delay_steps, <--- 强制设为 0
         )
     else:
         # Log the temporal delay configuration
@@ -138,6 +153,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             logging.info("Creating VLASHDataset with max_delay_steps=0 (no temporal delay)")
         
         # Create dataset with temporal offset augmentation
+        logging.warning("TT-RTC enabled: Forcing Dataset to align mode (max_delay_steps=0).")
         dataset = VLASHDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
@@ -146,7 +162,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
-            max_delay_steps=cfg.max_delay_steps,
+            max_delay_steps=dataset_delay_steps,# cfg.max_delay_steps, <--- 强制设为 0
         )
     
     # Apply ImageNet stats if requested (same as original make_dataset)
