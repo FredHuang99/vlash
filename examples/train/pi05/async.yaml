@@ -3,7 +3,7 @@
 # Policy configuration
 policy:
   type: pi05
-  pretrained_path: lerobot/pi05_base # download to local
+  pretrained_path: /workspace/models/pai_0.5_base # download to local
   push_to_hub: false
   dtype: bfloat16
   device: cuda
@@ -11,11 +11,12 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: <your dataset repository id> # download to local
+  repo_id: yifengzhu-hf/LIBERO-datasets # download to local
+  root: /workspace/datasets/libero_spatial
   video_backend: torchcodec
 
 # Training parameters
-output_dir: outputs/train/pi05_async # change to your desired output directory
+output_dir: /workspace/outputs/rtc_vlash # change to your desired output directory
 job_name: pi05_async
 batch_size: 32 #16
 steps: 30000 #50000
