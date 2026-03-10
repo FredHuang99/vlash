@@ -112,6 +112,11 @@ class VLASHAsyncManager:
         self.next_chunk: torch.Tensor | None = None   # Pre-computed (on GPU)
         self.chunk_index = 0  # Position within current chunk
         
+        # RTC inference: store the previous action chunk (in normalized action space)
+        # for prefix injection. This is the raw output from predict_action_chunk()
+        # before unnormalization, stored as a tensor on the inference device.
+        self.prev_action_chunk: torch.Tensor | None = None
+
         self.device = get_safe_torch_device(policy.config.device)
 
         # Validate configuration
@@ -183,6 +188,9 @@ class VLASHAsyncManager:
         use its final action as the observation state (predicting where
         the robot will be when this chunk finishes).
         
+        When the policy has inference_prefix_mask_steps > 0 (RTC mode),
+        passes the previous action chunk to enable prefix conditioning.
+        
         Args:
             observation: Current observation dictionary.
             
@@ -206,7 +214,15 @@ class VLASHAsyncManager:
             )
 
             # Run policy inference to get action chunk
-            action_chunk = self.policy.predict_action_chunk(observation)
+            # Pass prev_action_chunk for RTC prefix conditioning if available
+            action_chunk = self.policy.predict_action_chunk(
+                observation,
+                prev_action_chunk=self.prev_action_chunk,
+            )
+
+        # Store the current chunk as prev_action_chunk for next inference
+        # (keep on the same device, with batch dim for consistency)
+        self.prev_action_chunk = action_chunk.clone()
 
         # Remove batch dimension
         return action_chunk.squeeze(0)

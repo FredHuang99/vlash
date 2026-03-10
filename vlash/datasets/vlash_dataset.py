@@ -203,6 +203,7 @@ class VLASHDataset(LeRobotDataset):
             )
 
         item["observation.state"] = new_state
+        item["delay_steps"] = torch.tensor(offset, dtype=torch.long)
 
         return item
 
@@ -371,6 +372,7 @@ class SharedObservationVLASHDataset(VLASHDataset):
         result["action"] = torch.stack(actions, dim=0)  # [num_offsets, chunk_size, action_dim]
         result["action_is_pad"] = torch.stack(action_is_pads, dim=0)  # [num_offsets, chunk_size]
         result["num_offsets"] = num_offsets
+        result["delay_steps"] = torch.arange(num_offsets, dtype=torch.long)
         
         return result
 
@@ -395,7 +397,7 @@ def shared_observation_collate_fn(batch: list[dict]) -> dict:
     
     # Separate shared vs per-offset keys
     shared_keys = []
-    per_offset_keys = ["observation.state", "action", "action_is_pad"]
+    per_offset_keys = ["observation.state", "action", "action_is_pad", "delay_steps"]
     
     for key in batch[0]:
         if key not in per_offset_keys and key != "num_offsets":
@@ -420,6 +422,7 @@ def shared_observation_collate_fn(batch: list[dict]) -> dict:
     padded_states = torch.zeros(batch_size, max_offsets, *state_shape, device=device)
     padded_actions = torch.zeros(batch_size, max_offsets, *action_shape, device=device)
     padded_action_is_pad = torch.ones(batch_size, max_offsets, action_shape[0], dtype=torch.bool, device=device)
+    padded_delay_steps = torch.zeros(batch_size, max_offsets, dtype=torch.long, device=device)
     offset_mask = torch.zeros(batch_size, max_offsets, dtype=torch.bool, device=device)
     
     # Fill in actual values
@@ -428,11 +431,13 @@ def shared_observation_collate_fn(batch: list[dict]) -> dict:
         padded_states[i, :n] = item["observation.state"]
         padded_actions[i, :n] = item["action"]
         padded_action_is_pad[i, :n] = item["action_is_pad"]
+        padded_delay_steps[i, :n] = item["delay_steps"].to(device)
         offset_mask[i, :n] = True
     
     result["observation.state"] = padded_states  # [B, max_offsets, state_dim]
     result["action"] = padded_actions  # [B, max_offsets, chunk_size, action_dim]
     result["action_is_pad"] = padded_action_is_pad  # [B, max_offsets, chunk_size]
+    result["delay_steps"] = padded_delay_steps  # [B, max_offsets]
     result["offset_mask"] = offset_mask  # [B, max_offsets]
     result["max_offsets"] = max_offsets
     

@@ -116,6 +116,13 @@ class PI05Config(PreTrainedConfig):
     # This significantly improves stability and performance for PI0.5
     state_cond: bool = False
 
+    # === RTC Inference Parameters ===
+    # Number of prefix steps to inject from previous action chunk during inference.
+    # When > 0, the first N steps of x_t are replaced with prev_action_chunk
+    # at each denoising step, with timestamp = 0.0 (clean action).
+    # Set to 0 to disable (default, standard flow matching inference).
+    inference_prefix_mask_steps: int = 0
+
     # === Flow Matching Parameters ===
     num_inference_steps: int = 10  # Denoising steps during inference
     time_sampling_beta_alpha: float = 1.5  # Beta distribution alpha for time sampling

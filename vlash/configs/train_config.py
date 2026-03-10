@@ -99,7 +99,7 @@ class VLASHTrainConfig(TrainPipelineConfig):
     # Shared observation optimization: train all offsets together with shared
     # observation (images + language). This provides ~(max_delay_steps+1)x speedup
     # by computing observation embeddings only once and using custom attention
-    # masks to prevent cross-offset attention.
+    # Cross-offset attention.
     shared_observation: bool = False
 
     # LoRA configuration

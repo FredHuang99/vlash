@@ -160,10 +160,15 @@ class PI05SuffixEmbedder(nn.Module):
     def forward(self, state, noisy_actions, time):
         """Embed noisy actions with time and state conditioning.
         
+        Supports both scalar time [B] (standard flow matching) and per-step
+        time [B, T] (RTC prefix mask mode where different steps have different
+        timesteps, e.g. prefix steps have time=0.0 for clean actions).
+        
         Args:
             state: Robot state [B, state_dim].
             noisy_actions: Noisy action sequence x_t [B, T, action_dim].
-            time: Flow matching timestep [B].
+            time: Flow matching timestep, either [B] (scalar per sample) or
+                  [B, T] (per-step, used in RTC prefix mask mode).
             
         Returns:
             suffix_embs: Action embeddings [B, T, D].
@@ -171,24 +176,55 @@ class PI05SuffixEmbedder(nn.Module):
             att_masks: Attention masks [B, T].
             adarms_cond: Conditioning signal for adaRMS [B, D].
         """
-        # Create sinusoidal time embedding
-        time_emb = create_sinusoidal_pos_embedding(
-            time,
-            self.config.action_expert_config.hidden_size,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=time.device,
-        )
-        time_emb = time_emb.to(dtype=time.dtype)
-        
-        # Process time through MLP
-        time_emb = self.time_mlp_in(time_emb)
-        time_emb = F.silu(time_emb)
-        time_emb = self.time_mlp_out(time_emb)
-        time_emb = F.silu(time_emb)
+        hidden_size = self.config.action_expert_config.hidden_size
+        bsz = noisy_actions.shape[0]
+        action_time_dim = noisy_actions.shape[1]
+
+        # Determine if time is per-step [B, T] or scalar [B]
+        per_step_time = (time.ndim == 2)
+
+        if per_step_time:
+            # RTC mode: per-step time [B, T]
+            # Flatten to [B*T] for sinusoidal embedding, then reshape back
+            time_flat = time.reshape(-1)  # [B*T]
+            time_emb_flat = create_sinusoidal_pos_embedding(
+                time_flat,
+                hidden_size,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=time.device,
+            )
+            time_emb_flat = time_emb_flat.to(dtype=time.dtype)
+            # Process through time MLP: [B*T, D]
+            time_emb_flat = self.time_mlp_in(time_emb_flat)
+            time_emb_flat = F.silu(time_emb_flat)
+            time_emb_flat = self.time_mlp_out(time_emb_flat)
+            time_emb_flat = F.silu(time_emb_flat)
+            # Reshape to [B, T, D] — per-step time embedding (not used directly
+            # for adaRMS conditioning but stored for future extensions)
+            # For adaRMS conditioning, use the mean across steps [B, D]
+            time_emb_per_step = time_emb_flat.view(bsz, action_time_dim, -1)
+            time_emb = time_emb_per_step.mean(dim=1)  # [B, D]
+        else:
+            # Standard mode: scalar time [B]
+            time_emb = create_sinusoidal_pos_embedding(
+                time,
+                hidden_size,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=time.device,
+            )
+            time_emb = time_emb.to(dtype=time.dtype)
+            # Process time through MLP
+            time_emb = self.time_mlp_in(time_emb)
+            time_emb = F.silu(time_emb)
+            time_emb = self.time_mlp_out(time_emb)
+            time_emb = F.silu(time_emb)
 
         # Project noisy actions
         action_emb = self.action_in_proj(noisy_actions)
+
+        # adaRMS conditioning: always [B, D] for layer norm stability
         adarms_cond = time_emb
 
         # Add state conditioning if enabled
@@ -206,8 +242,7 @@ class PI05SuffixEmbedder(nn.Module):
         suffix_embs = action_emb
 
         # Create masks
-        bsz, action_time_dim = suffix_embs.shape[:2]
-        pad_masks = torch.ones(bsz, action_time_dim, dtype=torch.bool, device=time.device)
+        pad_masks = torch.ones(bsz, action_time_dim, dtype=torch.bool, device=noisy_actions.device)
 
         # First action token marks the boundary for causal attention
         att_row = torch.zeros(action_time_dim, dtype=suffix_embs.dtype, device=suffix_embs.device)
@@ -751,7 +786,7 @@ class PI05Model(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
-    def forward(self, images, img_masks, tokens, masks, state, actions, noise=None, time=None):
+    def forward(self, images, img_masks, tokens, masks, state, actions, noise=None, time=None, delay_steps=None):
         """Training forward pass: compute flow matching loss.
         
         Flow matching interpolates between actions (t=0) and noise (t=1):
@@ -759,6 +794,13 @@ class PI05Model(nn.Module):
         
         The model predicts velocity v_t, and loss is MSE(v_t, u_t) where:
             u_t = noise - actions (true velocity)
+        
+        When prefix_mask_steps > 0 (RTC mode):
+            - A random number of prefix steps K is sampled from [0, prefix_mask_steps]
+              using exponentially-weighted distribution (favoring smaller values)
+            - The first K steps have time forced to 0.0 (clean action in vlash convention)
+            - x_t for those steps becomes the ground truth action
+            - Per-step time [B, T] is passed to the suffix embedder
         
         Args:
             images: List of image tensors.
@@ -769,9 +811,13 @@ class PI05Model(nn.Module):
             actions: Ground truth actions [B, T, action_dim].
             noise: Optional noise (sampled if None).
             time: Optional timestep (sampled if None).
+            delay_steps: Int tensor of shape [B] specifying number of prefix steps (0 = disabled).
             
         Returns:
-            Per-element MSE loss [B, T, action_dim].
+            Tuple of:
+                - Per-element MSE loss [B, T, action_dim].
+                - prefix_mask: Boolean mask [B, T] where True = masked prefix position,
+                  or None if delay_steps is None or all zeros.
         """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -779,9 +825,34 @@ class PI05Model(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        # Interpolate between noise and actions
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        batch_size = actions.shape[0]
+        chunk_size = actions.shape[1]
+        device = actions.device
+
+        # RTC prefix mask: modify time and x_t for prefix positions
+        prefix_mask = None  # [B, T] boolean, True = masked prefix step
+        if delay_steps is not None and delay_steps.max() > 0:
+            # delay_steps: [B]
+            step_indices = torch.arange(chunk_size, device=device)
+            prefix_mask = step_indices[None, :] < delay_steps[:, None]  # [B, T]
+
+            # Override time to 0.0 for prefix steps
+            # time was [B], expand it to [B, T] for per-step time tracking
+            per_step_time = time[:, None].expand(-1, chunk_size).clone()  # [B, T]
+            per_step_time[prefix_mask] = 0.0  # Force prefix to clean action condition
+
+            # Build x_t with prefix forcing
+            time_expanded = per_step_time[:, :, None]  # [B, T, 1]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+
+            # Pass per-step time to suffix embedder
+            time_for_suffix = per_step_time  # [B, T]
+        else:
+            # Standard flow matching (no RTC)
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            time_for_suffix = time  # [B]
+
         u_t = noise - actions  # True velocity
 
         # Embed prefix (images + language)
@@ -790,8 +861,9 @@ class PI05Model(nn.Module):
         )
         
         # Embed suffix (noisy actions + time)
+        # time_for_suffix is either [B] (standard) or [B, T] (RTC per-step)
         suffix_embs, suffix_pad_masks, suffix_att_masks, suffix_adarms_cond = self.suffix_embedder(
-            state, x_t, time
+            state, x_t, time_for_suffix
         )
 
         # Match backbone dtype
@@ -829,7 +901,8 @@ class PI05Model(nn.Module):
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses, prefix_mask
 
     def forward_shared_observation(
         self,
@@ -842,11 +915,16 @@ class PI05Model(nn.Module):
         offset_mask,
         noise=None,
         time=None,
+        prefix_mask_steps=0,
     ):
         """Training forward pass with shared observation across multiple offsets.
         
         This method truly shares the prefix computation while handling per-offset
         adaRMS conditioning by using the layer's forward_shared_observation method.
+        
+        When prefix_mask_steps > 0, applies RTC prefix mask: the first K steps
+        of each action chunk are forced to ground truth (time=0.0) and should be
+        excluded from loss computation by the caller.
         
         Args:
             images: List of image tensors [B, C, H, W].
@@ -858,12 +936,17 @@ class PI05Model(nn.Module):
             offset_mask: Boolean mask [B, num_offsets] indicating valid offsets.
             noise: Optional noise tensor [B, num_offsets, T, action_dim].
             time: Optional flow matching timestep [B, num_offsets].
+            delay_steps: Int tensor of shape [B, num_offsets] for true dataset delay.
             
         Returns:
-            Loss tensor [B, num_offsets, T, action_dim].
+            Tuple of:
+                - Loss tensor [B, num_offsets, T, action_dim].
+                - prefix_mask: Boolean mask [B*num_offsets, T] where True = masked,
+                  or None if delay_steps is None or all zeros.
         """
         batch_size = states.shape[0]
         num_offsets = states.shape[1]
+        chunk_size = actions.shape[2]
         device = states.device
         
         if noise is None:
@@ -874,9 +957,35 @@ class PI05Model(nn.Module):
             time = self.sample_time(batch_size * num_offsets, actions.device)
             time = time.view(batch_size, num_offsets)
         
-        # Interpolate between noise and actions for each offset
-        time_expanded = time[:, :, None, None]  # [B, num_offsets, 1, 1]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        # RTC prefix mask logic
+        prefix_mask = None  # Will be [B*num_offsets, T] if active
+        if delay_steps is not None and delay_steps.max() > 0:
+            delay_flat = delay_steps.view(batch_size * num_offsets)
+            
+            # Create per-step mask: True for positions t < delay
+            step_indices = torch.arange(chunk_size, device=device)
+            # Mask shape: [B*num_offsets, T]
+            prefix_mask = step_indices[None, :] < delay_flat[:, None]
+
+            # Create per-step time: [B, num_offsets, T]
+            per_step_time = time[:, :, None].expand(-1, -1, chunk_size).clone()
+            
+            # Reshape prefix_mask back to [B, num_offsets, T] to apply to time
+            prefix_mask_reshaped = prefix_mask.view(batch_size, num_offsets, chunk_size)
+            per_step_time[prefix_mask_reshaped] = 0.0  # Force prefix to clean
+
+            # Build x_t with prefix forcing
+            time_expanded = per_step_time[:, :, :, None]  # [B, num_offsets, T, 1]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+
+            # Flatten time for suffix embedder: [B*num_offsets, T]
+            time_for_suffix = per_step_time.view(batch_size * num_offsets, chunk_size)
+        else:
+            # Standard flow matching (no RTC)
+            time_expanded = time[:, :, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            time_for_suffix = time.view(batch_size * num_offsets)  # [B*num_offsets]
+
         u_t = noise - actions  # True velocity
         
         # Embed shared prefix (images + language) only once
@@ -889,10 +998,10 @@ class PI05Model(nn.Module):
         # Flatten batch and offset dimensions for suffix embedding
         states_flat = states.view(batch_size * num_offsets, -1)
         x_t_flat = x_t.view(batch_size * num_offsets, x_t.shape[2], -1)
-        time_flat = time.view(batch_size * num_offsets)
+        # time_for_suffix is either [B*num_offsets] or [B*num_offsets, T]
         
         suffix_embs_flat, suffix_pad_masks_flat, suffix_att_masks_flat, suffix_adarms_cond_flat = self.suffix_embedder(
-            states_flat, x_t_flat, time_flat
+            states_flat, x_t_flat, time_for_suffix
         )
         suffix_length = suffix_embs_flat.shape[1]
         
@@ -961,7 +1070,7 @@ class PI05Model(nn.Module):
         # Compute MSE loss
         losses = F.mse_loss(u_t, v_t, reduction="none")
         
-        return losses
+        return losses, prefix_mask
 
     @torch.no_grad()
     def denoise_step(
@@ -1025,8 +1134,16 @@ class PI05Model(nn.Module):
         return self.action_out_proj(suffix_out)
 
     @torch.no_grad()
-    def sample_actions(self, images, img_masks, tokens, masks, state, noise=None, num_steps=None) -> torch.Tensor:
-        """Sample actions from noise.
+    def sample_actions(
+        self, images, img_masks, tokens, masks, state,
+        noise=None, num_steps=None, prev_action_chunk=None,
+    ) -> torch.Tensor:
+        """Sample actions from noise via ODE integration.
+        
+        When prev_action_chunk is provided and config.inference_prefix_mask_steps > 0,
+        applies RTC inference: the first K action steps in x_t are overwritten
+        with prev_action_chunk at each denoising step, and per-step time is used
+        with those positions set to 0.0 (clean action).
         
         Args:
             images: Input images.
@@ -1036,6 +1153,8 @@ class PI05Model(nn.Module):
             state: Robot state.
             noise: Initial noise (sampled if None).
             num_steps: Number of denoising steps.
+            prev_action_chunk: Previous action chunk [B, chunk_size, action_dim]
+                for RTC prefix injection. None if not available.
             
         Returns:
             Sampled actions [B, chunk_size, action_dim].
@@ -1045,6 +1164,10 @@ class PI05Model(nn.Module):
 
         bsz = tokens.shape[0]
         device = tokens.device
+
+        # Determine RTC inference prefix steps
+        prefix_steps = self.config.inference_prefix_mask_steps
+        use_rtc_inference = (prefix_steps > 0 and prev_action_chunk is not None)
 
         # Initialize from noise
         if noise is None:
@@ -1089,16 +1212,33 @@ class PI05Model(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         for _ in range(num_steps):
-            expanded_time = time.expand(bsz)
+            if use_rtc_inference:
+                # RTC inference: inject prev_action_chunk prefix into x_t
+                # Overwrite first prefix_steps positions with prev chunk actions
+                x_t[:, :prefix_steps, :] = prev_action_chunk[:, :prefix_steps, :]
+
+                # Create per-step time: [B, chunk_size]
+                # Prefix positions have time=0.0 (clean), rest have current time
+                per_step_time = time.expand(bsz, self.config.chunk_size).clone()
+                per_step_time[:, :prefix_steps] = 0.0
+                timestep_for_denoise = per_step_time  # [B, T]
+            else:
+                # Standard: scalar time for all steps
+                timestep_for_denoise = time.expand(bsz)  # [B]
+
             v_t = self.denoise_step(
                 prefix_pad_masks,
                 prefix_att_masks,
                 state,
                 x_t,
-                expanded_time,
+                timestep_for_denoise,
             )
             x_t = x_t + dt * v_t
             time = time + dt
+
+        # After denoising, overwrite prefix with clean actions one final time
+        if use_rtc_inference:
+            x_t[:, :prefix_steps, :] = prev_action_chunk[:, :prefix_steps, :]
 
         return x_t
 
@@ -1289,12 +1429,20 @@ class PI05Policy(PreTrainedPolicy):
         return self.parameters()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        prev_action_chunk: Tensor | None = None,
+    ) -> Tensor:
         """Predict a chunk of actions for inference.
         
         Args:
             batch: Input batch with images, state, task.
             noise: Optional noise for deterministic sampling.
+            prev_action_chunk: Previous action chunk [B, n_action_steps, action_dim]
+                for RTC inference prefix injection. If provided and config has
+                inference_prefix_mask_steps > 0, the first K steps are injected
+                as prefix conditioning.
             
         Returns:
             Action chunk [B, n_action_steps, action_dim].
@@ -1306,8 +1454,17 @@ class PI05Policy(PreTrainedPolicy):
 
         lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
 
+        # If prev_action_chunk is provided, normalize and pad to max_action_dim
+        normalized_prev_chunk = None
+        if prev_action_chunk is not None and self.config.inference_prefix_mask_steps > 0:
+            # Pad to max_action_dim to match model's internal representation
+            normalized_prev_chunk = pad_vector(prev_action_chunk, self.config.max_action_dim)
+            # Note: prev_action_chunk should already be in the model's normalized
+            # action space if coming from a previous predict_action_chunk call
+
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise, prev_action_chunk=normalized_prev_chunk,
         )
 
         # Trim to original action dimension
@@ -1339,6 +1496,10 @@ class PI05Policy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> tuple[Tensor, dict[str, Tensor]]:
         """Training forward pass.
         
+        When prefix_mask_steps > 0, applies RTC (Real-Time Chunking) prefix mask:
+        the first K steps of the action chunk are forced to ground truth during
+        flow matching, and their loss is excluded from backpropagation.
+        
         Args:
             batch: Training batch.
             noise: Optional noise for reproducibility.
@@ -1358,7 +1519,13 @@ class PI05Policy(PreTrainedPolicy):
 
         loss_dict: dict[str, Tensor | float] = {}
 
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        delay_steps = batch.get("delay_steps")
+
+        # Model returns (losses, prefix_mask) where prefix_mask is None or [B, T]
+        losses, prefix_mask = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions,
+            noise, time, delay_steps=delay_steps
+        )
 
         # Mask out padded actions
         if actions_is_pad is not None:
@@ -1367,7 +1534,19 @@ class PI05Policy(PreTrainedPolicy):
 
         losses = losses[:, :, : self.config.max_action_dim]
 
-        loss = losses.mean()
+        # Apply RTC prefix mask: exclude prefix positions from loss
+        if prefix_mask is not None:
+            # prefix_mask: [B, T], True = masked (prefix) position
+            # Zero out loss at masked positions and average over unmasked only
+            rtc_loss_mask = ~prefix_mask  # [B, T], True = valid (compute loss)
+            losses = losses * rtc_loss_mask.unsqueeze(-1).float()
+            # Compute mean over unmasked elements only
+            num_unmasked = rtc_loss_mask.float().sum() * losses.shape[-1]
+            loss = losses.sum() / num_unmasked.clamp(min=1)
+            loss_dict["rtc_prefix_steps"] = prefix_mask[0].sum().item()
+        else:
+            loss = losses.mean()
+
         loss_dict["loss"] = loss.item()
 
         return loss, loss_dict
@@ -1540,16 +1719,17 @@ class PI05Policy(PreTrainedPolicy):
         
         loss_dict: dict[str, Tensor | float] = {}
         
+        delay_steps = batch.get("delay_steps")  # [B, num_offsets]
+        
         # Call model's shared observation forward
-        losses = self.model.forward_shared_observation(
+        # Returns (losses, prefix_mask) where prefix_mask is None or [B*num_offsets, T]
+        losses, prefix_mask = self.model.forward_shared_observation(
             images, img_masks, lang_tokens, lang_masks,
             states_normalized, actions_normalized, offset_mask,
-            noise, time
-        )  # [B, num_offsets, chunk_size, action_dim]
+            noise, time, delay_steps=delay_steps
+        )  # losses: [B, num_offsets, chunk_size, action_dim]
         
         # Apply action padding mask (same as regular forward)
-        # Padded action positions are zeroed but still count in the denominator,
-        # matching the regular forward behavior where mean() includes padding.
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad  # [B, num_offsets, chunk_size]
             losses = losses * in_episode_bound.unsqueeze(-1)
@@ -1560,14 +1740,22 @@ class PI05Policy(PreTrainedPolicy):
         # Truncate to actual action dim
         losses = losses[:, :, :, :self.config.max_action_dim]
         
-        # Average over valid offsets only
-        # Each offset's mean is: offset_losses.sum() / (chunk_size * action_dim)
-        # We want: sum(offset_i_mean for valid i) / num_valid_offsets
-        # = sum(offset_losses) / (num_valid_offsets * chunk_size * action_dim)
-        # This matches regular forward behavior where each offset is trained separately
-        num_valid_offsets = offset_mask.sum()
-        num_elements_per_offset = losses.shape[2] * losses.shape[3]  # chunk_size * action_dim
-        loss = losses.sum() / (num_valid_offsets * num_elements_per_offset).clamp(min=1)
+        # Apply RTC prefix mask: exclude prefix positions from loss
+        if prefix_mask is not None:
+            # prefix_mask: [B*num_offsets, T] -> reshape to [B, num_offsets, T]
+            rtc_mask_reshaped = prefix_mask.view(batch_size, num_offsets, -1)
+            rtc_loss_mask = ~rtc_mask_reshaped  # True = valid (compute loss)
+            losses = losses * rtc_loss_mask.unsqueeze(-1).float()
+            loss_dict["rtc_prefix_steps"] = prefix_mask[0].sum().item()
+            # Compute valid element count: unmasked steps * valid offsets * action_dim
+            valid_offset_mask = offset_mask[:, :, None] & rtc_loss_mask  # [B, num_offsets, T]
+            num_valid_elements = valid_offset_mask.float().sum() * losses.shape[-1]
+            loss = losses.sum() / num_valid_elements.clamp(min=1)
+        else:
+            # Standard loss averaging
+            num_valid_offsets = offset_mask.sum()
+            num_elements_per_offset = losses.shape[2] * losses.shape[3]
+            loss = losses.sum() / (num_valid_offsets * num_elements_per_offset).clamp(min=1)
         
         loss_dict["loss"] = loss.item()
         loss_dict["num_offsets"] = num_offsets
