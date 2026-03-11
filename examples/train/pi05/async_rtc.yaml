@@ -64,7 +64,7 @@ max_delay_steps: 8
 # Enable shared observation optimization
 # When true, trains all offsets [0, max_delay_steps] together with shared
 # observation embeddings instead of randomly sampling one offset per sample
-shared_observation: False
+shared_observation: true
 
 # RTC prefix mask: during training, randomly sample prefix steps from
 # [0, max_prefix_mask_steps] per batch. The first K steps are forced to
