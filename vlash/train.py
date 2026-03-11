@@ -520,10 +520,11 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
             # Measure data loading time
             start_time = time.perf_counter()
             batch = next(dl_iter)
-            train_tracker.dataloading_s = time.perf_counter() - start_time
+            _dataloading_time = time.perf_counter() - start_time
+            train_tracker.dataloading_s = _dataloading_time
 
             if is_main_process:
-                print(f"[TRACE] Step {step}, Micro-step {micro_step}: Dataloader returned batch in {train_tracker.dataloading_s:.3f}s. Start forward/backward...", flush=True)
+                print(f"[TRACE] Step {step}, Micro-step {micro_step}: Dataloader returned batch in {_dataloading_time:.3f}s. Start forward/backward...", flush=True)
 
             # Only step optimizer on the last micro-batch
             do_step = micro_step == cfg.grad_accum_steps - 1
