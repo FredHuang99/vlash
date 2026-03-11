@@ -90,6 +90,9 @@ class VLASHDataset(LeRobotDataset):
             max_delay_steps: Maximum temporal delay for augmentation.
         """
         self.max_delay_steps = max_delay_steps
+        # When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
+        # This is required for LIBERO where state_dim != action_dim.
+        self.use_state_ground_truth = use_state_ground_truth
 
         super().__init__(
             repo_id=repo_id,
@@ -179,32 +182,31 @@ class VLASHDataset(LeRobotDataset):
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        # Index of the previous action (before the offset action chunk starts)
-        prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-
-        # Fetch previous action to use as state
-        obs_state = item["observation.state"]
-        prev_action = self.hf_dataset[prev_idx]["action"]
-
-        # Validate dimensions
-        if obs_state.dim() != 1 or prev_action.dim() != 1:
-            raise ValueError("For now only support 1D state/action.")
-
-        state_dim = obs_state.shape[0]
-        action_dim = prev_action.shape[0]
-
-        if state_dim == action_dim:
-            # Dimensions match: use previous action as state
-            new_state = prev_action
+        if self.use_state_ground_truth:
+            # Use recorded future state s_{t+offset}
+            future_idx = max(ep_start, min(ep_end - 1, idx + offset))
+            new_state = self.hf_dataset[future_idx]["observation.state"]
         else:
-            # Dimensions mismatch: pad or truncate prev_action to match state_dim
-            if action_dim < state_dim:
-                # Pad with zeros
-                padding = torch.zeros(state_dim - action_dim, dtype=prev_action.dtype, device=prev_action.device)
-                new_state = torch.cat([prev_action, padding])
+            # Use previous action a_{t+offset-1} as proxy future state
+            prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+            obs_state = item["observation.state"]
+            prev_action = self.hf_dataset[prev_idx]["action"]
+
+            # Validate dimensions
+            if obs_state.dim() != 1 or prev_action.dim() != 1:
+                raise ValueError("For now only support 1D state/action.")
+
+            state_dim = obs_state.shape[0]
+            action_dim = prev_action.shape[0]
+
+            if state_dim == action_dim:
+                new_state = prev_action
             else:
-                # Truncate to state_dim
-                new_state = prev_action[:state_dim]
+                raise ValueError(
+                    f"Unsupported state_dim != action_dim combination "
+                    "in VLASHDataset when applying async offset to observation.state. "
+                    "For LIBERO, set use_state_ground_truth=True."
+                )
 
         item["observation.state"] = new_state
         item["delay_steps"] = torch.tensor(offset, dtype=torch.long)
@@ -240,6 +242,8 @@ class SharedObservationVLASHDataset(VLASHDataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         max_delay_steps: int = 0,
+        *,
+        use_state_ground_truth: bool = False,
     ):
         """Initialize SharedObservationVLASHDataset.
         
@@ -258,6 +262,7 @@ class SharedObservationVLASHDataset(VLASHDataset):
             video_backend=video_backend,
             batch_encoding_size=batch_encoding_size,
             max_delay_steps=max_delay_steps,
+            use_state_ground_truth=use_state_ground_truth,
         )
 
     def _get_query_indices_for_offset(
@@ -341,25 +346,29 @@ class SharedObservationVLASHDataset(VLASHDataset):
             if offset == 0:
                 state = base_item["observation.state"]
             else:
-                # State is previous action (action at t + offset - 1)
-                prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-                prev_action = self.hf_dataset[prev_idx]["action"]
-                
-                obs_state = base_item["observation.state"]
-                if obs_state.dim() != 1 or prev_action.dim() != 1:
-                    raise ValueError("For now only support 1D state/action.")
-                
-                state_dim = obs_state.shape[0]
-                action_dim = prev_action.shape[0]
-                
-                if state_dim == action_dim:
-                    state = prev_action
+                if self.use_state_ground_truth:
+                    future_idx = max(ep_start, min(ep_end - 1, idx + offset))
+                    state = self.hf_dataset[future_idx]["observation.state"]
                 else:
-                    if action_dim < state_dim:
-                        padding = torch.zeros(state_dim - action_dim, dtype=prev_action.dtype, device=prev_action.device)
-                        state = torch.cat([prev_action, padding])
+                    # State is previous action (action at t + offset - 1)
+                    prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+                    prev_action = self.hf_dataset[prev_idx]["action"]
+                    
+                    obs_state = base_item["observation.state"]
+                    if obs_state.dim() != 1 or prev_action.dim() != 1:
+                        raise ValueError("For now only support 1D state/action.")
+                    
+                    state_dim = obs_state.shape[0]
+                    action_dim = prev_action.shape[0]
+                    
+                    if state_dim == action_dim:
+                        state = prev_action
                     else:
-                        state = prev_action[:state_dim]
+                        raise ValueError(
+                            f"Unsupported state_dim != action_dim combination "
+                            "in SharedObservationVLASHDataset when applying async offset. "
+                            "For LIBERO, set use_state_ground_truth=True."
+                        )
             states.append(state)
             
             # Get actions for this offset

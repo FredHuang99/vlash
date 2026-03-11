@@ -126,6 +126,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
             max_delay_steps=cfg.max_delay_steps,
+            use_state_ground_truth=cfg.use_state_ground_truth,
         )
     else:
         # Log the temporal delay configuration
@@ -147,6 +148,7 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
             max_delay_steps=cfg.max_delay_steps,
+            use_state_ground_truth=cfg.use_state_ground_truth,
         )
     
     # Apply ImageNet stats if requested (same as original make_dataset)
