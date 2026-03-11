@@ -24,7 +24,7 @@ dataset:
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
 job_name: pi05_rtc_vlash
-batch_size: 2
+batch_size: 1
 steps: 50000
 num_workers: 4
 seed: 1000
@@ -79,4 +79,4 @@ shared_observation: true
 # Effective batch = batch_size * grad_accum_steps * num_gpus
 # For 2x H200: 16 * 16 * 2 = 512 (matches RTC paper)
 # For 4x A100: 16 * 8 * 4 = 512
-grad_accum_steps: 85 # 512 // batch_size // num_gpus
+grad_accum_steps: 170 # 512 // batch_size // num_gpus
