@@ -6,7 +6,7 @@
 # Policy configuration
 policy:
   type: pi05
-  pretrained_path: /workspace/models/pi0.5_libero_base
+  pretrained_path: /workspace/models/lerobot_pi05_libero_base
   push_to_hub: false
   dtype: bfloat16
   device: cuda
@@ -19,12 +19,12 @@ dataset:
   repo_id: dummy/dummy
   video_backend: torchcodec
   # To use a local dataset, set root to the local path:
-  root: /workspace/datasets/libero_spatial_image
+  root: /workspace/datasets/lerobot_libero_spatial
 
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
 job_name: pi05_rtc_vlash
-batch_size: 1
+batch_size: 8
 steps: 50000
 num_workers: 4
 seed: 1000
@@ -83,4 +83,4 @@ use_state_ground_truth: true
 # Effective batch = batch_size * grad_accum_steps * num_gpus
 # For 2x H200: 16 * 16 * 2 = 512 (matches RTC paper)
 # For 4x A100: 16 * 8 * 4 = 512
-grad_accum_steps: 170 # 512 // batch_size // num_gpus
+grad_accum_steps: 8 # 512 // batch_size // num_gpus
