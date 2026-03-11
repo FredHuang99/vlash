@@ -915,7 +915,7 @@ class PI05Model(nn.Module):
         offset_mask,
         noise=None,
         time=None,
-        prefix_mask_steps=0,
+        delay_steps=None,
     ):
         """Training forward pass with shared observation across multiple offsets.
         
