@@ -514,10 +514,16 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
 
         # Gradient accumulation: accumulate gradients over multiple micro-batches
         for micro_step in range(cfg.grad_accum_steps):
+            if is_main_process:
+                print(f"[TRACE] Step {step}, Micro-step {micro_step}: Waiting for next batch from dataloader...", flush=True)
+
             # Measure data loading time
             start_time = time.perf_counter()
             batch = next(dl_iter)
             train_tracker.dataloading_s = time.perf_counter() - start_time
+
+            if is_main_process:
+                print(f"[TRACE] Step {step}, Micro-step {micro_step}: Dataloader returned batch in {train_tracker.dataloading_s:.3f}s. Start forward/backward...", flush=True)
 
             # Only step optimizer on the last micro-batch
             do_step = micro_step == cfg.grad_accum_steps - 1
@@ -537,6 +543,9 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
                 use_shared_observation=use_shared_observation,
             )
             step_compute_time += time.perf_counter() - compute_start
+            
+            if is_main_process:
+                print(f"[TRACE] Step {step}, Micro-step {micro_step}: update_policy finished.", flush=True)
 
         # Record total compute time for this optimizer step
         train_tracker.update_s = step_compute_time
