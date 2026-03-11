@@ -71,7 +71,9 @@ shared_observation: true
 # ground truth and excluded from loss. This trains the model to condition
 # on previously executed actions for better real-time inference.
 # Recommended: 4-8 (should be <= chunk_size)
-max_prefix_mask_steps: 8
+# max_prefix_mask_steps: 8  
+# the prefix per item in each batch has been forced to equal with the actual delay steps per item
+# making this parameter useless
 
 # Gradient accumulation for larger effective batch size
 # Effective batch = batch_size * grad_accum_steps * num_gpus
