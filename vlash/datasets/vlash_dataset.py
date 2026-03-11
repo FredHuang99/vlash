@@ -197,10 +197,14 @@ class VLASHDataset(LeRobotDataset):
             # Dimensions match: use previous action as state
             new_state = prev_action
         else:
-            raise ValueError(
-                f"Unsupported state_dim != action_dim combination "
-                "in VLASHDataset when applying async offset to observation.state. "
-            )
+            # Dimensions mismatch: pad or truncate prev_action to match state_dim
+            if action_dim < state_dim:
+                # Pad with zeros
+                padding = torch.zeros(state_dim - action_dim, dtype=prev_action.dtype, device=prev_action.device)
+                new_state = torch.cat([prev_action, padding])
+            else:
+                # Truncate to state_dim
+                new_state = prev_action[:state_dim]
 
         item["observation.state"] = new_state
         item["delay_steps"] = torch.tensor(offset, dtype=torch.long)
@@ -351,10 +355,11 @@ class SharedObservationVLASHDataset(VLASHDataset):
                 if state_dim == action_dim:
                     state = prev_action
                 else:
-                    raise ValueError(
-                        f"Unsupported state_dim != action_dim combination "
-                        "in SharedObservationVLASHDataset when applying async offset."
-                    )
+                    if action_dim < state_dim:
+                        padding = torch.zeros(state_dim - action_dim, dtype=prev_action.dtype, device=prev_action.device)
+                        state = torch.cat([prev_action, padding])
+                    else:
+                        state = prev_action[:state_dim]
             states.append(state)
             
             # Get actions for this offset
