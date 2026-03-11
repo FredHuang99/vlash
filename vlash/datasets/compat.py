@@ -46,14 +46,21 @@ def patched_get_safe_version(repo_id: str, revision: str | None) -> str:
     This patch returns the actual version instead, enabling loading.
     """
     from huggingface_hub import HfApi
+    from huggingface_hub.utils import RepositoryNotFoundError, HFValidationError
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION
+    import requests
     
     api = HfApi()
-    dataset_info = api.list_repo_refs(repo_id, repo_type="dataset")
     
-    # Get all version tags
-    versions = [tag.name for tag in dataset_info.tags if tag.name.startswith("v")]
-    
+    # Attempt to fetch from Hugging Face Hub; fallback gracefully for local offline datasets
+    try:
+        dataset_info = api.list_repo_refs(repo_id, repo_type="dataset")
+        # Get all version tags
+        versions = [tag.name for tag in dataset_info.tags if tag.name.startswith("v")]
+    except (RepositoryNotFoundError, HFValidationError, requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+        logging.warning(f"Failed to fetch refs for '{repo_id}' from Hugging Face Hub (Offline/Local dataset). Error: {e}")
+        return revision or "main"
+        
     if not versions:
         # No version tags, use main/revision
         return revision or "main"
