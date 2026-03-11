@@ -16,14 +16,14 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: /workspace/datasets/libero_spatial
+  repo_id: /workspace/datasets/libero_non_100
   video_backend: torchcodec
   # To use a local dataset, set root to the local path:
   # root: /path/to/local/dataset
 
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
-job_name: pi05_rtc
+job_name: pi05_rtc_vlash
 batch_size: 16
 steps: 50000
 num_workers: 4
@@ -53,7 +53,7 @@ save_freq: 10000
 log_freq: 200
 wandb:
   enable: true
-  project: vlash
+  project: rtc_vlash
   entity: null
   disable_artifact: true
 
@@ -77,4 +77,4 @@ max_prefix_mask_steps: 8
 # Effective batch = batch_size * grad_accum_steps * num_gpus
 # For 2x H200: 16 * 16 * 2 = 512 (matches RTC paper)
 # For 4x A100: 16 * 8 * 4 = 512
-grad_accum_steps: 16
+grad_accum_steps: 8 # 512 // batch_size // num_gpus
