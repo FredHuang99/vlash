@@ -16,10 +16,10 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: /workspace/datasets/libero_non_100
+  repo_id: dummy/dummy
   video_backend: torchcodec
   # To use a local dataset, set root to the local path:
-  # root: /path/to/local/dataset
+  root: /workspace/datasets/libero_non_100
 
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
