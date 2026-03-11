@@ -72,6 +72,8 @@ class VLASHDataset(LeRobotDataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         max_delay_steps: int = 0,
+        *,
+        use_state_ground_truth: bool = False,
     ):
         """Initialize VLASH dataset.
         
