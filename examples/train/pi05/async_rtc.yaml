@@ -19,7 +19,7 @@ dataset:
   repo_id: dummy/dummy
   video_backend: torchcodec
   # To use a local dataset, set root to the local path:
-  root: /workspace/datasets/libero_non_100
+  root: /workspace/datasets/libero_spatial_image
 
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
