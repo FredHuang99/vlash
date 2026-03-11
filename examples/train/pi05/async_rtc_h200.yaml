@@ -23,9 +23,9 @@ dataset:
 
 # Training parameters
 output_dir: /workspace/outputs/rtc_vlash
-job_name: pi05_rtc_vlash
+job_name: pi05_rtc_vlash_h200
 batch_size: 16
-steps: 50000
+steps: 5000
 num_workers: 8
 seed: 1000
 
@@ -40,20 +40,20 @@ optimizer:
 # Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 1000
+  num_warmup_steps: 100
   peak_lr: 5.0e-5
   decay_lr: 2.5e-6
-  num_decay_steps: 50000
+  num_decay_steps: 5000
 
 # Checkpointing
 save_checkpoint: true
-save_freq: 10000
+save_freq: 1000
 
 # Logging
-log_freq: 200
+log_freq: 50
 wandb:
   enable: true
-  project: rtc_vlash
+  project: rtc_vlash_h200
   entity: null
   disable_artifact: true
 
