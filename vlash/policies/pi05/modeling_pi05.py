@@ -30,6 +30,8 @@ Architecture:
 """
 
 import builtins
+import json
+import logging
 import math
 import os
 from collections import deque
@@ -59,6 +61,177 @@ from vlash.policies.pi05.utils import (
 from vlash.layers.attention import Attention
 from vlash.layers.linear import QKVLinear, MergedColumnLinear
 from vlash.layers.rope import RotaryEmbedding
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_checkpoint_file(
+    pretrained_name_or_path: str | Path,
+    filename: str,
+    *,
+    cache_dir: str | Path | None,
+    force_download: bool,
+    resume_download: bool | None,
+    proxies: dict | None,
+    token: str | bool | None,
+    revision: str | None,
+    local_files_only: bool,
+) -> str | None:
+    """Resolve an auxiliary checkpoint file from a local directory or the Hub."""
+    if os.path.isdir(pretrained_name_or_path):
+        local_path = os.path.join(pretrained_name_or_path, filename)
+        return local_path if os.path.isfile(local_path) else None
+
+    from transformers.utils import cached_file
+
+    try:
+        return cached_file(
+            pretrained_name_or_path,
+            filename,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+            _raise_exceptions_for_missing_entries=False,
+        )
+    except TypeError:
+        try:
+            return cached_file(
+                pretrained_name_or_path,
+                filename,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                revision=revision,
+                local_files_only=local_files_only,
+            )
+        except OSError:
+            return None
+    except OSError:
+        return None
+
+
+def _extract_processor_state_files(processor_config_path: str) -> list[str]:
+    """Extract auxiliary processor state filenames from a LeRobot processor config."""
+    with open(processor_config_path, encoding="utf-8") as f:
+        processor_config = json.load(f)
+
+    state_files: list[str] = []
+    for step in processor_config.get("steps", []):
+        state_file = step.get("state_file")
+        if isinstance(state_file, str) and state_file:
+            state_files.append(state_file)
+    return state_files
+
+
+def _map_processor_stats_to_module_state(
+    processor_state: dict[str, Tensor],
+    feature_names: set[str],
+) -> dict[str, Tensor]:
+    """Map LeRobot processor flat stats to VLASH Normalize/Unnormalize module keys."""
+    mapped: dict[str, Tensor] = {}
+    for flat_key, value in processor_state.items():
+        if "." not in flat_key:
+            continue
+        feature_key, stat_name = flat_key.rsplit(".", 1)
+        if feature_key not in feature_names:
+            continue
+        module_key = f"buffer_{feature_key.replace('.', '_')}.{stat_name}"
+        mapped[module_key] = value
+    return mapped
+
+
+def _load_processor_stats_into_policy(
+    instance,
+    pretrained_name_or_path: str | Path,
+    *,
+    cache_dir: str | Path | None,
+    force_download: bool,
+    resume_download: bool | None,
+    proxies: dict | None,
+    token: str | bool | None,
+    revision: str | None,
+    local_files_only: bool,
+) -> None:
+    """Load normalization statistics from LeRobot processor state files when available."""
+    from safetensors.torch import load_file
+
+    config_filenames = ("policy_preprocessor.json", "policy_postprocessor.json")
+    state_filenames: list[str] = []
+
+    for config_filename in config_filenames:
+        config_path = _resolve_checkpoint_file(
+            pretrained_name_or_path,
+            config_filename,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if not config_path:
+            continue
+        state_filenames.extend(_extract_processor_state_files(config_path))
+
+    # Fallback for older / differently-exported checkpoints.
+    for fallback_name in (
+        "policy_preprocessor_step_5_normalizer_processor.safetensors",
+        "policy_preprocessor_step_2_normalizer_processor.safetensors",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    ):
+        if fallback_name not in state_filenames:
+            state_filenames.append(fallback_name)
+
+    state_filenames = list(dict.fromkeys(state_filenames))
+
+    processor_state: dict[str, Tensor] = {}
+    for state_filename in state_filenames:
+        state_path = _resolve_checkpoint_file(
+            pretrained_name_or_path,
+            state_filename,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if not state_path:
+            continue
+        processor_state.update(load_file(state_path))
+
+    if not processor_state:
+        return
+
+    input_stats = _map_processor_stats_to_module_state(
+        processor_state, set(instance.config.input_features.keys())
+    )
+    output_stats = _map_processor_stats_to_module_state(
+        processor_state, set(instance.config.output_features.keys())
+    )
+
+    if input_stats:
+        instance.normalize_inputs.load_state_dict(input_stats, strict=False)
+    if output_stats:
+        instance.normalize_targets.load_state_dict(output_stats, strict=False)
+        instance.unnormalize_outputs.load_state_dict(output_stats, strict=False)
+
+
+def _find_uninitialized_norm_buffers(module: nn.Module) -> list[str]:
+    """Return any normalization buffer keys that still contain non-finite sentinels."""
+    missing: list[str] = []
+    for key, value in module.state_dict().items():
+        if torch.is_floating_point(value) and not torch.isfinite(value).all():
+            missing.append(key)
+    return missing
 
 
 class PI05PrefixEmbedder(nn.Module):
@@ -1402,12 +1575,47 @@ class PI05Policy(PreTrainedPolicy):
         incompatible = instance.load_state_dict(mapped_sd, strict=False)
         missing_keys, unexpected_keys = incompatible.missing_keys, incompatible.unexpected_keys
 
+        # Some LeRobot checkpoints store normalization statistics in processor state files
+        # instead of model.safetensors. Hydrate those buffers before inference.
+        _load_processor_stats_into_policy(
+            instance,
+            pretrained_name_or_path,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+
         unexpected_fatal = list(unexpected_keys)
         if unexpected_fatal:
             raise RuntimeError(
                 "Checkpoint loading failed.\n"
                 f"Unexpected keys: {unexpected_fatal}"
             )
+
+        missing_norm_keys = (
+            _find_uninitialized_norm_buffers(instance.normalize_inputs)
+            + _find_uninitialized_norm_buffers(instance.normalize_targets)
+            + _find_uninitialized_norm_buffers(instance.unnormalize_outputs)
+        )
+        if missing_norm_keys:
+            raise RuntimeError(
+                "Checkpoint is missing normalization statistics required for PI0.5 inference. "
+                "This usually means the processor state files were not found or could not be "
+                "loaded. Missing buffers: "
+                f"{sorted(missing_norm_keys)}"
+            )
+
+        ignored_missing = [
+            key
+            for key in missing_keys
+            if not key.startswith(("normalize_inputs.", "normalize_targets.", "unnormalize_outputs."))
+        ]
+        if ignored_missing:
+            logger.info("Ignoring non-fatal missing checkpoint keys: %s", ignored_missing)
 
         instance.to(config.device)
         instance.eval()
