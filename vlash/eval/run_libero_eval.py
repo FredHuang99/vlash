@@ -19,9 +19,11 @@ execution with VLA policy inference, with dynamic chunk offset logic.
 """
 
 import argparse
+from contextlib import contextmanager
 import inspect
 import multiprocessing as mp
 import os
+import pickle
 import time
 from logging import getLogger
 
@@ -202,6 +204,39 @@ def _format_duration_s(duration_s: float) -> str:
     return f"{duration_s:.2f}s"
 
 
+@contextmanager
+def _torch_load_weights_only_disabled():
+    """Temporarily force torch.load(..., weights_only=False) for legacy LIBERO assets."""
+    original_torch_load = torch.load
+
+    def compat_torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = compat_torch_load
+    try:
+        yield
+    finally:
+        torch.load = original_torch_load
+
+
+def _get_task_init_states(task_suite, task_id: int):
+    """Load LIBERO task init states with a PyTorch 2.6 compatibility fallback."""
+    try:
+        return task_suite.get_task_init_states(task_id)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+
+        logger.warning(
+            "LIBERO init states triggered torch.load(weights_only=True) on PyTorch >= 2.6; "
+            "retrying task %d with weights_only=False. Use this only with trusted LIBERO assets.",
+            task_id,
+        )
+        with _torch_load_weights_only_disabled():
+            return task_suite.get_task_init_states(task_id)
+
+
 def _load_eval_config(config_path: str, cli_overrides: dict | None = None) -> LiberoEvalConfig:
     """Load LIBERO eval config from YAML and apply CLI overrides."""
     with open(config_path, encoding="utf-8") as f:
@@ -372,7 +407,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
 
         for task_id in range(num_tasks_in_suite):
             task = task_suite.get_task(task_id)
-            initial_states = task_suite.get_task_init_states(task_id)
+            initial_states = _get_task_init_states(task_suite, task_id)
             env, task_description = get_libero_env(task, cfg.policy.type, resolution=cfg.resolution)
 
             task_episodes = 0
