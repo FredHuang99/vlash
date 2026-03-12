@@ -106,6 +106,14 @@ def _average_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float
     return {key: totals[key] / counts[key] for key in totals}
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as H:MM:SS."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+
 def make_vlash_dataset(cfg: VLASHTrainConfig):
     """Create a VLASHDataset for training with temporal delay augmentation.
     
@@ -206,7 +214,7 @@ def update_policy(
     loss_scale: float = 1.0,
     do_step: bool = True,
     use_shared_observation: bool = False,
-) -> tuple[MetricsTracker, dict]:
+) -> tuple[MetricsTracker, dict, float]:
     """
     Performs a single training step to update the policy's weights.
 
@@ -230,6 +238,7 @@ def update_policy(
         Tuple of:
         - Updated MetricsTracker with loss, grad_norm, and lr.
         - Dictionary of policy outputs (for logging auxiliary metrics).
+        - Raw unscaled loss value for this micro-step.
     """
     policy.train()
 
@@ -279,12 +288,13 @@ def update_policy(
             accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
     # Record metrics
-    train_metrics.loss = raw_loss.item()
+    raw_loss_value = raw_loss.item()
+    train_metrics.loss = raw_loss_value
     if grad_norm_value is not None:
         train_metrics.grad_norm = grad_norm_value
     train_metrics.lr = optimizer.param_groups[0]["lr"]
-    
-    return train_metrics, output_dict
+
+    return train_metrics, output_dict, raw_loss_value
 
 
 def auto_resume(cfg: VLASHTrainConfig) -> None:
@@ -558,6 +568,8 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Start offline training on a fixed dataset")
+    train_loop_start_time = time.perf_counter()
+    initial_step = step
 
     # === Main Training Loop ===
     for _ in range(step, cfg.steps):
@@ -579,7 +591,7 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
 
             # Forward + backward (+ optimizer step if do_step)
             compute_start = time.perf_counter()
-            train_tracker, output_dict = update_policy(
+            train_tracker, output_dict, raw_loss_value = update_policy(
                 train_tracker,
                 policy,
                 batch,
@@ -592,7 +604,7 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
                 use_shared_observation=use_shared_observation,
             )
             step_compute_time += time.perf_counter() - compute_start
-            micro_step_losses.append(train_tracker.loss)
+            micro_step_losses.append(raw_loss_value)
             if output_dict:
                 micro_step_output_dicts.append(output_dict)
 
@@ -616,12 +628,32 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
 
         # === Logging ===
         if is_log_step:
+            elapsed_time = time.perf_counter() - train_loop_start_time
+            completed_steps = max(1, step - initial_step)
+            avg_step_time = elapsed_time / completed_steps
+            remaining_steps = max(0, cfg.steps - step)
+            eta_seconds = remaining_steps * avg_step_time
+            progress_pct = 100.0 * step / cfg.steps if cfg.steps > 0 else 100.0
+            logging.info(
+                "Progress: step %s/%s (%.2f%%), remaining=%s, avg_step=%0.2fs, ETA=%s",
+                format_big_number(step),
+                format_big_number(cfg.steps),
+                progress_pct,
+                format_big_number(remaining_steps),
+                avg_step_time,
+                _format_duration(eta_seconds),
+            )
             logging.info(train_tracker)
             if wandb_logger:
                 # Get window-averaged metrics from tracker
                 wandb_log_dict = {
                     key: _to_python_scalar(value) for key, value in train_tracker.to_dict().items()
                 }
+                wandb_log_dict["progress_step"] = step
+                wandb_log_dict["progress_remaining_steps"] = remaining_steps
+                wandb_log_dict["progress_pct"] = progress_pct
+                wandb_log_dict["progress_avg_step_s"] = avg_step_time
+                wandb_log_dict["progress_eta_s"] = eta_seconds
 
                 # Merge model-specific outputs (e.g., auxiliary losses)
                 if output_dict:
