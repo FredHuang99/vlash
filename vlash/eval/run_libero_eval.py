@@ -248,11 +248,14 @@ def _sanitize_libero_action(action, model_family: str) -> np.ndarray:
         )
         return expected_action.copy()
 
+    max_abs_before_clip = float(np.max(np.abs(action)))
     clipped = np.clip(action, -1.0, 1.0)
-    if not np.allclose(clipped, action):
+    # Tiny excursions like 1.0001 are usually just floating-point/unnormalization noise.
+    # Only surface a warning when the action is meaningfully outside robosuite's range.
+    if max_abs_before_clip > 1.01:
         logger.warning(
             "Clipped LIBERO action outside [-1, 1]; max_abs_before_clip=%.4f",
-            float(np.max(np.abs(action))),
+            max_abs_before_clip,
         )
     return clipped.astype(np.float32, copy=False)
 
@@ -701,11 +704,14 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                     log_dir=cfg.local_log_dir,
                 )
 
-                log_file.write(
-                    "Task: "
-                    f"{task_id} | Ep: {episode_idx} | Success: {episode_success} | "
-                    f"Idle Steps: {episode_idle_steps} | Trial Time: {_format_duration_s(trial_duration_s)}\n"
+                trial_summary = (
+                    f"Task {task_id} | Trial {episode_idx + 1}/{cfg.num_trials_per_task} | "
+                    f"Success: {episode_success} | Idle Steps: {episode_idle_steps} | "
+                    f"Trial Time: {_format_duration_s(trial_duration_s)}"
                 )
+                print(trial_summary)
+                logger.info(trial_summary)
+                log_file.write(trial_summary + "\n")
                 log_file.flush()
 
             avg_task_trial_time_s = float(np.mean(task_trial_durations_s)) if task_trial_durations_s else 0.0
