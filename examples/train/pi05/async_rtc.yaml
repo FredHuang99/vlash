@@ -25,7 +25,7 @@ dataset:
 output_dir: /workspace/outputs/rtc_vlash_a800_spatial
 job_name: pi05_rtc_vlash_a800
 batch_size: 4
-steps: 30000
+steps: 40000
 num_workers: 8
 dataloader_prefetch_factor: 2
 dataloader_persistent_workers: true
@@ -46,10 +46,10 @@ optimizer:
 # Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 1000
+  num_warmup_steps: 1300
   peak_lr: 2.5e-5
   decay_lr: 2.5e-6
-  num_decay_steps: 30000
+  num_decay_steps: 40000
 
 # Checkpointing
 save_checkpoint: true
@@ -86,6 +86,7 @@ use_state_ground_truth: false
 # making this parameter useless
 
 # Gradient accumulation
-# For 8x A800: 4 x 8 x 1 = 32 global samples per optimizer step before shared
-# observation expands offsets. That is already plenty for this dataset size.
+# For 6x A800: 4 x 6 x 1 = 24 global samples per optimizer step before shared
+# observation expands offsets. We raise training steps/scheduler span to keep
+# total seen samples close to the original 32@30k recipe.
 grad_accum_steps: 1
