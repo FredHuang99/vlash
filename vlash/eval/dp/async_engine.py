@@ -75,8 +75,8 @@ class AsyncEngine:
 
         policy_class = get_policy_class(cfg.policy.type)
         self._policy = policy_class.from_pretrained(
-            cfg.policy.pretrained_path,
-            revision=cfg.policy.revision,
+            pretrained_name_or_path=cfg.policy.pretrained_path,
+            config=cfg.policy,
         )
         self._policy.to(self._device)
         self._policy.eval()

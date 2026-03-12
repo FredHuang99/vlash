@@ -224,8 +224,8 @@ def run_inference_worker(config_path, pipe_conn):
         # Load policy
         policy_class = get_policy_class(cfg.policy.type)
         policy = policy_class.from_pretrained(
-            cfg.policy.pretrained_path,
-            revision=cfg.policy.revision,
+            pretrained_name_or_path=cfg.policy.pretrained_path,
+            config=cfg.policy,
         )
         policy.to(device)
         policy.eval()
