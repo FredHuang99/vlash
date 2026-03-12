@@ -63,6 +63,8 @@ from vlash.layers.linear import QKVLinear, MergedColumnLinear
 from vlash.layers.rope import RotaryEmbedding
 
 logger = logging.getLogger(__name__)
+OBS_LANG_TOKENS = "observation.language.tokens"
+OBS_LANG_MASK = "observation.language.attention_mask"
 
 
 def _resolve_checkpoint_file(
@@ -1601,12 +1603,12 @@ class PI05Policy(PreTrainedPolicy):
             + _find_uninitialized_norm_buffers(instance.normalize_targets)
             + _find_uninitialized_norm_buffers(instance.unnormalize_outputs)
         )
-        if missing_norm_keys:
-            raise RuntimeError(
-                "Checkpoint is missing normalization statistics required for PI0.5 inference. "
-                "This usually means the processor state files were not found or could not be "
-                "loaded. Missing buffers: "
-                f"{sorted(missing_norm_keys)}"
+        instance._missing_internal_normalization_stats = sorted(set(missing_norm_keys))
+        if instance._missing_internal_normalization_stats:
+            logger.warning(
+                "PI0.5 checkpoint is missing internal normalization statistics. "
+                "Inference must use LeRobot pre/post processors. Missing buffers: %s",
+                instance._missing_internal_normalization_stats,
             )
 
         ignored_missing = [
@@ -1655,12 +1657,27 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             Action chunk [B, n_action_steps, action_dim].
         """
-        batch = self.normalize_inputs(batch)
+        batch = dict(batch)
+        is_preprocessed = bool(batch.pop("_already_preprocessed", False))
+        if not is_preprocessed:
+            is_preprocessed = OBS_LANG_TOKENS in batch and OBS_LANG_MASK in batch
+
+        if not is_preprocessed:
+            if getattr(self, "_missing_internal_normalization_stats", None):
+                raise RuntimeError(
+                    "This PI0.5 checkpoint requires LeRobot pre/post processors for inference "
+                    "because internal normalization statistics are missing."
+                )
+            batch = self.normalize_inputs(batch)
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
 
-        lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
+        if is_preprocessed and OBS_LANG_TOKENS in batch and OBS_LANG_MASK in batch:
+            lang_tokens = batch[OBS_LANG_TOKENS]
+            lang_masks = batch[OBS_LANG_MASK].to(dtype=torch.bool)
+        else:
+            lang_tokens, lang_masks = self.prepare_language(batch, pad_to_max_length=False)
 
         # If prev_action_chunk is provided, normalize and pad to max_action_dim
         normalized_prev_chunk = None
@@ -1679,7 +1696,8 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        actions = self.unnormalize_outputs({"action": actions})["action"]
+        if not is_preprocessed:
+            actions = self.unnormalize_outputs({"action": actions})["action"]
 
         return actions[:, : self.config.n_action_steps, :]
 

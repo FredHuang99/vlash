@@ -34,6 +34,11 @@ import tqdm
 import yaml
 
 try:
+    from lerobot.policies.factory import make_pre_post_processors
+except ImportError:
+    make_pre_post_processors = None
+
+try:
     from libero.libero import benchmark
 except ModuleNotFoundError as exc:
     if exc.name != "libero":
@@ -298,6 +303,49 @@ def _load_eval_config(config_path: str, cli_overrides: dict | None = None) -> Li
     return cfg
 
 
+def _postprocess_action_chunk(action_chunk) -> np.ndarray:
+    """Convert a policy/postprocessor action payload to a host-side numpy chunk."""
+    if isinstance(action_chunk, dict):
+        for key in ("action", "actions"):
+            if key in action_chunk:
+                action_chunk = action_chunk[key]
+                break
+
+    if isinstance(action_chunk, torch.Tensor):
+        action_chunk = action_chunk.detach().cpu().numpy()
+    else:
+        action_chunk = np.asarray(action_chunk, dtype=np.float32)
+
+    if action_chunk.ndim == 3 and action_chunk.shape[0] == 1:
+        action_chunk = action_chunk[0]
+
+    return np.asarray(action_chunk, dtype=np.float32)
+
+
+def _make_lerobot_processors(policy_config, pretrained_path: str):
+    """Best-effort creation of LeRobot pre/post processors across API variants."""
+    if make_pre_post_processors is None:
+        return None, None
+
+    attempts = (
+        lambda: make_pre_post_processors(policy_config, pretrained_path=pretrained_path),
+        lambda: make_pre_post_processors(policy_config, pretrained_name_or_path=pretrained_path),
+        lambda: make_pre_post_processors(policy_config, pretrained_path),
+    )
+
+    last_error = None
+    for build in attempts:
+        try:
+            return build()
+        except TypeError as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    return None, None
+
+
 def run_inference_worker(config_path, pipe_conn):
     """Worker process that holds the GPU model and performs inference."""
     try:
@@ -313,6 +361,25 @@ def run_inference_worker(config_path, pipe_conn):
         policy.to(device)
         policy.eval()
         supports_prev_action_chunk = "prev_action_chunk" in inspect.signature(policy.predict_action_chunk).parameters
+        preprocessor = None
+        postprocessor = None
+        uses_official_processors = False
+
+        if make_pre_post_processors is not None:
+            try:
+                preprocessor, postprocessor = _make_lerobot_processors(
+                    policy.config,
+                    cfg.policy.pretrained_path,
+                )
+                uses_official_processors = preprocessor is not None and postprocessor is not None
+            except Exception as exc:
+                logger.warning("Failed to initialize LeRobot pre/post processors: %s", exc)
+
+        if getattr(policy, "_missing_internal_normalization_stats", None) and not uses_official_processors:
+            raise RuntimeError(
+                "Checkpoint is missing normalization statistics required for PI0.5 inference, "
+                "and LeRobot pre/post processors could not be initialized."
+            )
 
         logger.info(f"Worker: Model loaded on {device}")
 
@@ -355,17 +422,28 @@ def run_inference_worker(config_path, pipe_conn):
                 state_np = np.asarray(obs_np["observation.state"], dtype=np.float32)
                 obs_np["observation.state"] = _build_vlash_state(state_np, old_chunk, k, vlash_delay_k)
 
-            model_obs = {}
-            for key, value in obs_np.items():
-                # Add batch dimension and move to device
-                model_obs[key] = torch.from_numpy(value).unsqueeze(0).to(device)
+            if uses_official_processors:
+                model_obs = dict(obs_np)
+                model_obs["task"] = task_description
+                model_obs = dict(preprocessor(model_obs))
+                model_obs["_already_preprocessed"] = True
+            else:
+                model_obs = {}
+                for key, value in obs_np.items():
+                    # Add batch dimension and move to device
+                    model_obs[key] = torch.from_numpy(value).unsqueeze(0).to(device)
 
-            # Fake language tasks/tools format
-            model_obs["task"] = [task_description]
+                # Fake language tasks/tools format
+                model_obs["task"] = [task_description]
 
             kwargs = {}
             effective_prefix_steps = 0
             if use_rtc and supports_prev_action_chunk:
+                if uses_official_processors and getattr(policy, "_missing_internal_normalization_stats", None):
+                    raise RuntimeError(
+                        "RTC prefix conditioning is not supported for this checkpoint when using external "
+                        "LeRobot processors, because internal target normalizers are unavailable."
+                    )
                 rtc_prefix_actions = _extract_rtc_prefix_actions(old_chunk, k, rtc_prefix_k)
                 if rtc_prefix_actions is not None and rtc_prefix_actions.shape[0] > 0:
                     rtc_prefix_tensor = torch.from_numpy(rtc_prefix_actions).unsqueeze(0).to(device)
@@ -386,8 +464,11 @@ def run_inference_worker(config_path, pipe_conn):
                 finally:
                     _restore_policy_prefix_steps(policy, old_policy_steps, old_model_steps)
 
+            if uses_official_processors:
+                action_chunk = postprocessor(action_chunk)
+
             # Remove batch dim and send back to host as numpy array
-            action_chunk_np = action_chunk.squeeze(0).cpu().numpy()
+            action_chunk_np = _postprocess_action_chunk(action_chunk)
             pipe_conn.send(action_chunk_np)
 
     except Exception as e:
