@@ -5,7 +5,7 @@ policy:
   # Fill your policy checkpoint path.
   path: /workspace/models/pi0.5_libero_base
   device: cuda
-  compile_model: true
+  compile_model: false
   fuse_qkv: true
   fuse_gate_up: true
 

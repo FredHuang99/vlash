@@ -205,6 +205,53 @@ def _format_duration_s(duration_s: float) -> str:
     return f"{duration_s:.2f}s"
 
 
+def _env_check_success(env) -> bool:
+    """Handle LIBERO env API differences across versions."""
+    if hasattr(env, "check_success"):
+        return bool(env.check_success())
+    if hasattr(env, "_check_success"):
+        return bool(env._check_success())
+
+    logger.warning(
+        "LIBERO env %s exposes neither check_success() nor _check_success(); "
+        "treating the episode as not yet successful.",
+        type(env).__name__,
+    )
+    return False
+
+
+def _sanitize_libero_action(action, model_family: str) -> np.ndarray:
+    """Keep actions finite and within robosuite's normalized control range."""
+    expected_action = np.asarray(get_libero_dummy_action(model_family), dtype=np.float32)
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+    if action.shape[0] != expected_action.shape[0]:
+        logger.warning(
+            "Policy emitted action_dim=%d but LIBERO expects %d; adapting action shape.",
+            action.shape[0],
+            expected_action.shape[0],
+        )
+        adapted = expected_action.copy()
+        copy_dim = min(action.shape[0], adapted.shape[0])
+        adapted[:copy_dim] = action[:copy_dim]
+        action = adapted
+
+    if not np.all(np.isfinite(action)):
+        logger.warning(
+            "Policy emitted non-finite LIBERO action %s; falling back to dummy no-op action.",
+            action,
+        )
+        return expected_action.copy()
+
+    clipped = np.clip(action, -1.0, 1.0)
+    if not np.allclose(clipped, action):
+        logger.warning(
+            "Clipped LIBERO action outside [-1, 1]; max_abs_before_clip=%.4f",
+            float(np.max(np.abs(action))),
+        )
+    return clipped.astype(np.float32, copy=False)
+
+
 @contextmanager
 def _torch_load_weights_only_disabled():
     """Temporarily force torch.load(..., weights_only=False) for legacy LIBERO assets."""
@@ -534,7 +581,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
 
                     # 6. Execute action.
                     if _remaining_actions(current_chunk, current_k) > 0:
-                        action = current_chunk[current_k]
+                        action = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
                         current_k += 1
                         obs, reward, done, info = env.step(action)
                     else:
@@ -544,14 +591,14 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                     pbar.update(1)
                     t += 1
 
-                    if done or env._check_success():
+                    if done or _env_check_success(env):
                         task_successes += 1
                         total_successes += 1
                         break
 
                 pbar.close()
                 all_idle_steps.append(episode_idle_steps)
-                episode_success = bool(done or env._check_success())
+                episode_success = bool(done or _env_check_success(env))
                 trial_duration_s = time.perf_counter() - trial_start_time
                 task_trial_durations_s.append(trial_duration_s)
                 if episode_success:
