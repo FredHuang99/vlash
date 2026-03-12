@@ -96,15 +96,71 @@ If you want to silence the warnings and generate the optional file once, run:
 python3 /root/miniconda3/envs/vlash/lib/python3.10/site-packages/robosuite/scripts/setup_macros.py
 ```
 
-## matplotlib
+## matplotlib and NumPy
 
-LIBERO's upstream `requirements.txt` pins `matplotlib==3.5.3`, and LIBERO imports
-`matplotlib.cm` from `libero/libero/envs/env_wrapper.py` during environment setup.
-For VLASH, use the same pinned version from the upstream LIBERO project:
+LIBERO's upstream `requirements.txt` pins old versions such as `numpy==1.22.4` and
+`matplotlib==3.5.3`, and LIBERO imports `matplotlib.cm` from
+`libero/libero/envs/env_wrapper.py` during environment setup.
+
+However, VLASH depends on `lerobot==0.4.1`, and LeRobot currently requires:
+
+- `packaging>=24.2,<26.0`
+- `opencv-python-headless>=4.9.0,<4.13.0`
+- `rerun-sdk>=0.24.0,<0.27.0`
+
+In practice, those LeRobot-era packages are much happier in a NumPy 2 environment than in a
+legacy NumPy 1 environment. If you downgrade NumPy to 1.x just to satisfy old LIBERO pins, you
+can trigger conflicts with `opencv-python-headless` and `rerun-sdk`.
+
+For the shared VLASH environment, the recommended approach is:
+
+1. keep NumPy 2
+2. install a NumPy-2-compatible `matplotlib`
+3. keep `packaging` below 26 to satisfy LeRobot
+4. use exactly one OpenCV wheel in the environment
+
+If your environment was already mutated by older pins, repair it with:
 
 ```bash
-python3 -m pip install matplotlib==3.5.3
+python3 -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless
+python3 -m pip install --force-reinstall --no-cache-dir "packaging==25.0" "numpy>=2,<2.3" "matplotlib>=3.10.3,<4.0.0" "opencv-python>=4.9.0,<5.0.0"
 ```
+
+Why not use LIBERO's original `matplotlib==3.5.3` here?
+
+- that version was built for the old NumPy 1.x stack
+- with NumPy 2.x it can fail with `_ARRAY_API not found` or `numpy.core.multiarray failed to import`
+- newer Matplotlib releases are compatible with the LeRobot / NumPy 2 stack used by VLASH
+
+## OpenCV package choice
+
+`robosuite==1.4.1` and `reachy2-sdk` declare a dependency on `opencv-python`, while
+LeRobot declares `opencv-python-headless`.
+
+The OpenCV wheel maintainers explicitly recommend installing only one of these packages in a
+single environment because they all provide the same `cv2` namespace.
+
+That means there is no perfectly clean one-env solution here: pip will complain about one side
+or the other. For LIBERO evaluation, prefer `opencv-python`, because that satisfies the direct
+requirements of `robosuite` and `reachy2-sdk`.
+
+If you want the most stable setup, use a separate conda env for LIBERO evaluation, for example:
+
+```bash
+conda create -n vlash-libero python=3.10
+conda activate vlash-libero
+conda install ffmpeg=7.1.1 -c conda-forge
+cd /workspace/vlash
+python3 -m pip install -e .
+cd /workspace/LIBERO
+touch libero/__init__.py
+python3 -m pip install .
+cd /workspace/vlash
+python3 -m pip install -r /workspace/vlash/examples/eval/libero_requirements.txt
+```
+
+If you must keep a single shared env, install only `opencv-python` and accept that `pip` may
+still warn that LeRobot asked for the headless wheel.
 
 ## Run eval
 

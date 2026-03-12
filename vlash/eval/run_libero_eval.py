@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as tmp
 import tqdm
+import yaml
 
 try:
     from libero.libero import benchmark
@@ -43,7 +44,6 @@ except ModuleNotFoundError as exc:
         "Verify from a neutral directory such as `/tmp`, not from inside the LIBERO source tree."
     ) from exc
 
-from lerobot.configs import parser as config_parser
 from lerobot.utils.utils import get_safe_torch_device
 
 from vlash.configs import LiberoEvalConfig
@@ -202,10 +202,23 @@ def _format_duration_s(duration_s: float) -> str:
     return f"{duration_s:.2f}s"
 
 
+def _load_eval_config(config_path: str, cli_overrides: dict | None = None) -> LiberoEvalConfig:
+    """Load LIBERO eval config from YAML and apply CLI overrides."""
+    with open(config_path, encoding="utf-8") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    if not isinstance(config_data, dict):
+        raise ValueError(f"Expected mapping in config file, got {type(config_data).__name__}")
+
+    cfg = LiberoEvalConfig(**config_data)
+    _apply_cli_overrides(cfg, cli_overrides)
+    return cfg
+
+
 def run_inference_worker(config_path, pipe_conn):
     """Worker process that holds the GPU model and performs inference."""
     try:
-        cfg = config_parser.parse(LiberoEvalConfig, ["--config", config_path])
+        cfg = _load_eval_config(config_path)
         device = get_safe_torch_device(cfg.policy.device)
 
         # Load policy
@@ -317,8 +330,7 @@ def _apply_cli_overrides(cfg: LiberoEvalConfig, cli_overrides: dict | None) -> N
 
 def eval_libero(config_path: str, cli_overrides: dict | None = None):
     """Main evaluation loop."""
-    cfg = config_parser.parse(LiberoEvalConfig, ["--config", config_path])
-    _apply_cli_overrides(cfg, cli_overrides)
+    cfg = _load_eval_config(config_path, cli_overrides)
 
     tmp.set_start_method("spawn", force=True)
 

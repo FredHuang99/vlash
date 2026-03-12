@@ -1,10 +1,12 @@
-# Extra packages for running VLASH with LIBERO.
-# Modeled on OpenVLA's LIBERO setup, plus VLASH's direct OpenCV dependency.
+# Extra packages for running VLASH with LIBERO in the shared VLASH / LeRobot env.
+# Keep these aligned with LeRobot's dependency constraints where possible,
+# but note that robosuite / reachy2-sdk expect the non-headless OpenCV wheel.
 imageio[ffmpeg]
 robosuite==1.4.1
 bddl
 easydict
 cloudpickle
 gym
-matplotlib==3.5.3
-opencv-python==4.11.0.86
+packaging>=24.2,<26.0
+matplotlib>=3.10.3,<4.0.0
+opencv-python>=4.9.0,<5.0.0
