@@ -185,6 +185,11 @@ def _build_inference_meta(cfg: LiberoEvalConfig, old_chunk: np.ndarray | None, k
     }
 
 
+def _format_duration_s(duration_s: float) -> str:
+    """Format wall-clock duration in seconds for logs."""
+    return f"{duration_s:.2f}s"
+
+
 def run_inference_worker(config_path, pipe_conn):
     """Worker process that holds the GPU model and performs inference."""
     try:
@@ -348,6 +353,8 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
 
             task_episodes = 0
             task_successes = 0
+            task_trial_durations_s = []
+            task_success_durations_s = []
 
             for episode_idx in range(cfg.num_trials_per_task):
                 logger.info(
@@ -359,6 +366,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 )
                 env.reset()
                 obs = env.set_init_state(initial_states[episode_idx])
+                trial_start_time = time.perf_counter()
 
                 t = 0
                 replay_images = []
@@ -488,6 +496,10 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 pbar.close()
                 all_idle_steps.append(episode_idle_steps)
                 episode_success = bool(done or env._check_success())
+                trial_duration_s = time.perf_counter() - trial_start_time
+                task_trial_durations_s.append(trial_duration_s)
+                if episode_success:
+                    task_success_durations_s.append(trial_duration_s)
 
                 task_episodes += 1
                 total_episodes += 1
@@ -501,11 +513,41 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 )
 
                 log_file.write(
-                    f"Task: {task_id} | Ep: {episode_idx} | Success: {episode_success} | Idle Steps: {episode_idle_steps}\n"
+                    "Task: "
+                    f"{task_id} | Ep: {episode_idx} | Success: {episode_success} | "
+                    f"Idle Steps: {episode_idle_steps} | Trial Time: {_format_duration_s(trial_duration_s)}\n"
                 )
                 log_file.flush()
 
+            avg_task_trial_time_s = float(np.mean(task_trial_durations_s)) if task_trial_durations_s else 0.0
+            avg_task_success_time_s = (
+                float(np.mean(task_success_durations_s)) if task_success_durations_s else None
+            )
+
             logger.info(f"Task {task_id} Success Rate: {task_successes}/{task_episodes}")
+            logger.info(
+                "Task %d Avg Trial Time (all): %s over %d trials",
+                task_id,
+                _format_duration_s(avg_task_trial_time_s),
+                len(task_trial_durations_s),
+            )
+            if avg_task_success_time_s is not None:
+                logger.info(
+                    "Task %d Avg Trial Time (success only): %s over %d successful trials",
+                    task_id,
+                    _format_duration_s(avg_task_success_time_s),
+                    len(task_success_durations_s),
+                )
+            else:
+                logger.info("Task %d Avg Trial Time (success only): N/A (0 successful trials)", task_id)
+
+            log_file.write(
+                f"Task {task_id} Summary | Success Rate: {task_successes}/{task_episodes} | "
+                f"Avg Trial Time (all): {_format_duration_s(avg_task_trial_time_s)} | "
+                f"Avg Trial Time (success only): "
+                f"{_format_duration_s(avg_task_success_time_s) if avg_task_success_time_s is not None else 'N/A'}\n"
+            )
+            log_file.flush()
 
         logger.info(f"Total Success Rate: {total_successes}/{total_episodes}")
         avg_latency = np.mean(all_inference_latencies) if all_inference_latencies else 0.0
