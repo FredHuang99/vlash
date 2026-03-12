@@ -51,6 +51,7 @@ from lerobot.utils.utils import get_safe_torch_device
 from vlash.configs import LiberoEvalConfig
 from vlash.policies.factory import get_policy_class
 from vlash.eval.libero_utils import (
+    build_libero_model_obs,
     get_libero_dummy_action,
     get_libero_env,
     get_libero_images,
@@ -470,11 +471,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                         )
                     ).astype(np.float32)
 
-                    current_model_obs = {
-                        "observation.image": img_dict["observation.image"],
-                        "observation.wrist_image": img_dict["observation.wrist_image"],
-                        "observation.state": robot_state,
-                    }
+                    current_model_obs = build_libero_model_obs(img_dict, robot_state, cfg.policy)
                     remaining_actions = _remaining_actions(current_chunk, current_k)
 
                     # 3. Trigger async inference.

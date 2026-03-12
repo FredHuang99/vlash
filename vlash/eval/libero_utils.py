@@ -15,6 +15,7 @@
 
 import math
 import os
+from logging import getLogger
 import cv2
 
 import imageio
@@ -33,6 +34,9 @@ except ModuleNotFoundError as exc:
         "`python3 -m pip install -r /path/to/vlash/examples/eval/libero_requirements.txt`. "
         "Verify from a neutral directory such as `/tmp`, not from inside the LIBERO source tree."
     ) from exc
+
+
+logger = getLogger(__name__)
 
 
 def get_libero_env(task, model_family, resolution=224):
@@ -94,6 +98,75 @@ def get_libero_images(obs, resize_size):
         "observation.image": img_agent,
         "observation.wrist_image": img_wrist
     }
+
+
+def _to_policy_image(image: np.ndarray) -> np.ndarray:
+    """Convert LIBERO image to CHW float32 in [0, 1] for VLASH policies."""
+    image = np.asarray(image)
+
+    if image.ndim != 3:
+        raise ValueError(f"Expected image with 3 dims, got shape {image.shape}")
+
+    if image.shape[-1] == 3:
+        image = np.transpose(image, (2, 0, 1))
+    elif image.shape[0] != 3:
+        raise ValueError(f"Expected image in HWC or CHW RGB format, got shape {image.shape}")
+
+    image = image.astype(np.float32, copy=False)
+    if image.max() > 1.0 or image.min() < 0.0:
+        image = np.clip(image / 255.0, 0.0, 1.0)
+
+    return np.ascontiguousarray(image)
+
+
+def build_libero_model_obs(img_dict: dict, robot_state: np.ndarray, policy_config) -> dict:
+    """Map LIBERO observations to the image/state keys expected by a policy checkpoint."""
+    agent_img = _to_policy_image(img_dict["observation.image"])
+    wrist_img = _to_policy_image(img_dict["observation.wrist_image"])
+
+    image_features = getattr(policy_config, "image_features", {}) or {}
+    image_feature_keys = list(image_features.keys())
+
+    model_obs = {
+        "observation.state": np.asarray(robot_state, dtype=np.float32),
+    }
+
+    if not image_feature_keys:
+        model_obs["observation.image"] = agent_img
+        model_obs["observation.wrist_image"] = wrist_img
+        return model_obs
+
+    fallback_img = np.zeros_like(agent_img)
+    assigned_agent = False
+    assigned_wrist = False
+
+    for index, feature_key in enumerate(image_feature_keys):
+        lower_key = feature_key.lower()
+
+        if "empty_camera_" in lower_key:
+            continue
+        if any(token in lower_key for token in ("wrist", "image2", "left", "right", "hand")):
+            model_obs[feature_key] = wrist_img
+            assigned_wrist = True
+            continue
+        if not assigned_agent:
+            model_obs[feature_key] = agent_img
+            assigned_agent = True
+            continue
+        if not assigned_wrist:
+            model_obs[feature_key] = wrist_img
+            assigned_wrist = True
+            continue
+
+        # Some checkpoints may declare additional cameras that LIBERO does not expose.
+        model_obs[feature_key] = fallback_img
+        logger.warning(
+            "Policy expects extra image feature '%s' beyond LIBERO's available cameras; "
+            "using a zero image placeholder.",
+            feature_key,
+        )
+
+    return model_obs
 
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None, log_dir="./experiments/logs"):
