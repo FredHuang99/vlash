@@ -28,9 +28,10 @@ except ModuleNotFoundError as exc:
         raise
     raise ModuleNotFoundError(
         "LIBERO is not installed in the current Python environment. "
-        "Install LIBERO with `python -m pip install -e /path/to/LIBERO`, then install "
+        "Install LIBERO with `python3 -m pip install /path/to/LIBERO`, then install "
         "VLASH's extra LIBERO dependencies with "
-        "`python -m pip install -r /path/to/vlash/examples/eval/libero_requirements.txt`."
+        "`python3 -m pip install -r /path/to/vlash/examples/eval/libero_requirements.txt`. "
+        "Verify from a neutral directory such as `/tmp`, not from inside the LIBERO source tree."
     ) from exc
 
 
