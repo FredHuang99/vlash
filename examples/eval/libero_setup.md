@@ -35,6 +35,7 @@ From the VLASH environment:
 conda activate vlash
 
 cd /workspace/LIBERO
+touch libero/__init__.py
 python3 -m pip uninstall -y libero
 python3 -m pip install .
 
@@ -52,10 +53,14 @@ cd LIBERO
 python3 -m pip install .
 ```
 
+Create `/workspace/LIBERO/libero/__init__.py` before installing.
+The upstream LIBERO repo has `libero/libero/__init__.py` but not `libero/__init__.py`, while
+its `setup.py` uses `find_packages()`. With modern packaging tooling, that can leave you in a
+broken state where `python3 -m pip show libero` succeeds but `import libero` only works when
+your current directory is `/workspace/LIBERO`.
+
 Use a regular install for LIBERO instead of `python3 -m pip install -e .`.
-In practice, LIBERO's package layout can appear importable only when your current working
-directory is `/workspace/LIBERO`, which makes editable installs look successful even when
-`python3 -m vlash.eval.run_libero_eval ...` will still fail from another directory.
+That avoids relying on editable-install behavior for this legacy package layout.
 
 ## Sanity checks
 
@@ -66,11 +71,40 @@ python3 -m pip show libero
 cd /tmp
 python3 -c "import sys; print(sys.executable)"
 python3 -c "from libero.libero import benchmark; print('libero ok')"
-python3 -c "import cv2, imageio, robosuite, bddl; print('deps ok')"
+python3 -c "import cv2, imageio, robosuite, bddl, matplotlib; print('deps ok')"
 ```
 
 Run the `libero` import test from a neutral directory such as `/tmp`, not from `/workspace/LIBERO`.
 If you test from `/workspace/LIBERO`, Python may import directly from the source tree and hide a broken install.
+
+## robosuite macro warnings
+
+You may see warnings like:
+
+```text
+[robosuite WARNING] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file
+```
+
+These warnings are usually non-fatal for LIBERO evaluation.
+They mean `robosuite` did not find its optional local `macros_private.py` override file.
+
+If evaluation is otherwise running, you can ignore them.
+If you want to silence the warnings and generate the optional file once, run:
+
+```bash
+python3 /root/miniconda3/envs/vlash/lib/python3.10/site-packages/robosuite/scripts/setup_macros.py
+```
+
+## matplotlib
+
+LIBERO's upstream `requirements.txt` pins `matplotlib==3.5.3`, and LIBERO imports
+`matplotlib.cm` from `libero/libero/envs/env_wrapper.py` during environment setup.
+For VLASH, use the same pinned version from the upstream LIBERO project:
+
+```bash
+python3 -m pip install matplotlib==3.5.3
+```
 
 ## Run eval
 
