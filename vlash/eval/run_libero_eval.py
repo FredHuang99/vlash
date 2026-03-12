@@ -423,7 +423,12 @@ def run_inference_worker(config_path, pipe_conn):
                 obs_np["observation.state"] = _build_vlash_state(state_np, old_chunk, k, vlash_delay_k)
 
             if uses_official_processors:
-                model_obs = dict(obs_np)
+                model_obs = {}
+                for key, value in obs_np.items():
+                    if isinstance(value, np.ndarray):
+                        model_obs[key] = torch.from_numpy(value)
+                    else:
+                        model_obs[key] = value
                 model_obs["task"] = task_description
                 model_obs = dict(preprocessor(model_obs))
                 model_obs["_already_preprocessed"] = True
