@@ -13,13 +13,14 @@
 # limitations under the License.
 """Utils for evaluating policies in LIBERO simulation environments."""
 
+import json
 import math
 import os
 from logging import getLogger
-import cv2
 
 import imageio
 import numpy as np
+from PIL import Image
 
 try:
     from libero.libero import get_libero_path
@@ -39,19 +40,19 @@ except ModuleNotFoundError as exc:
 logger = getLogger(__name__)
 
 
-def get_libero_env(task, model_family, resolution=224):
+def get_libero_env(task, render_resolution=256, seed=7):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
     env_args = {
         "bddl_file_name": task_bddl_file, 
-        "camera_heights": resolution, 
-        "camera_widths": resolution,
+        "camera_heights": render_resolution,
+        "camera_widths": render_resolution,
         # We explicitly request both agentview and eye-in-hand cameras for PI0.5
         "camera_names": ["agentview", "robot0_eye_in_hand"],
     }
     env = OffScreenRenderEnv(**env_args)
-    env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 
 
@@ -60,14 +61,41 @@ def get_libero_dummy_action(model_family: str):
     return [0, 0, 0, 0, 0, 0, -1]
 
 
-def resize_image(img, resize_size):
-    """
-    Takes numpy array corresponding to a single image and returns resized image as numpy array.
-    """
-    assert isinstance(resize_size, tuple)
-    # Using cv2 for fast resizing instead of TensorFlow to avoid TF dependency
-    img = cv2.resize(img, resize_size, interpolation=cv2.INTER_LANCZOS4)
+def convert_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert floating-point images back to uint8, matching openpi's client helper."""
+    if np.issubdtype(img.dtype, np.floating):
+        img = (255 * img).astype(np.uint8)
     return img
+
+
+def resize_with_pad(img: np.ndarray, target_height: int, target_width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Replicate openpi/openpi-client resize_with_pad semantics for a single HWC image."""
+    img = np.asarray(img)
+    if img.shape[:2] == (target_height, target_width):
+        return np.ascontiguousarray(convert_to_uint8(img))
+
+    pil_img = Image.fromarray(convert_to_uint8(img))
+    cur_height, cur_width = img.shape[:2]
+    ratio = max(cur_width / target_width, cur_height / target_height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_img = pil_img.resize((resized_width, resized_height), resample=method)
+
+    padded = Image.new(resized_img.mode, (target_width, target_height), 0)
+    pad_height = max(0, int((target_height - resized_height) / 2))
+    pad_width = max(0, int((target_width - resized_width) / 2))
+    padded.paste(resized_img, (pad_width, pad_height))
+    return np.ascontiguousarray(np.asarray(padded))
+
+
+def _extract_rotated_libero_images(obs: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Extract and 180-rotate LIBERO agentview and wrist images to match training preprocessing."""
+    img_agent = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    if "robot0_eye_in_hand_image" in obs:
+        img_wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    else:
+        img_wrist = np.zeros_like(img_agent)
+    return img_agent, img_wrist
 
 
 def get_libero_images(obs, resize_size):
@@ -79,24 +107,28 @@ def get_libero_images(obs, resize_size):
     assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
     if isinstance(resize_size, int):
         resize_size = (resize_size, resize_size)
-    
-    # 1. Agentview image
-    img_agent = obs["agentview_image"]
-    img_agent = img_agent[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
-    img_agent = resize_image(img_agent, resize_size)
-    
-    # 2. Wrist image (if available)
-    if "robot0_eye_in_hand_image" in obs:
-        img_wrist = obs["robot0_eye_in_hand_image"]
-        img_wrist = img_wrist[::-1, ::-1]  # rotate 180 degrees
-        img_wrist = resize_image(img_wrist, resize_size)
-    else:
-        # Fallback if the environment is misconfigured
-        img_wrist = np.zeros_like(img_agent)
+    img_agent, img_wrist = _extract_rotated_libero_images(obs)
+    img_agent = resize_with_pad(img_agent, resize_size[0], resize_size[1])
+    img_wrist = resize_with_pad(img_wrist, resize_size[0], resize_size[1])
 
     return {
-        "observation.image": img_agent,
-        "observation.wrist_image": img_wrist
+        "observation.image": convert_to_uint8(img_agent),
+        "observation.wrist_image": convert_to_uint8(img_wrist),
+    }
+
+
+def get_libero_debug_images(obs, resize_size):
+    """Return raw rotated and final resized LIBERO images for alignment debugging."""
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
+
+    raw_agent, raw_wrist = _extract_rotated_libero_images(obs)
+    processed = get_libero_images(obs, resize_size)
+    return {
+        "raw_agentview": raw_agent,
+        "raw_wrist": raw_wrist,
+        "processed_agentview": processed["observation.image"],
+        "processed_wrist": processed["observation.wrist_image"],
     }
 
 
@@ -183,6 +215,47 @@ def save_rollout_video(rollout_images, idx, success, task_description, log_file=
     if log_file is not None:
         log_file.write(f"Saved rollout MP4 at path {mp4_path}\n")
     return mp4_path
+
+
+def save_alignment_debug_artifacts(
+    debug_root: str,
+    task_id: int,
+    trial_idx: int,
+    task_description: str,
+    debug_images: dict,
+    robot_state: np.ndarray,
+    raw_action_chunk: np.ndarray,
+    clipped_action_chunk: np.ndarray,
+    clip_count: int,
+    max_abs_before_clip: float,
+) -> str:
+    """Persist a compact debug bundle for one trial's first alignment sample."""
+    safe_task = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    trial_dir = os.path.join(debug_root, f"task_{task_id:02d}_trial_{trial_idx + 1:03d}_{safe_task}")
+    os.makedirs(trial_dir, exist_ok=True)
+
+    imageio.imwrite(os.path.join(trial_dir, "raw_agentview.png"), debug_images["raw_agentview"])
+    imageio.imwrite(os.path.join(trial_dir, "raw_wrist.png"), debug_images["raw_wrist"])
+    imageio.imwrite(os.path.join(trial_dir, "processed_agentview.png"), debug_images["processed_agentview"])
+    imageio.imwrite(os.path.join(trial_dir, "processed_wrist.png"), debug_images["processed_wrist"])
+
+    np.save(os.path.join(trial_dir, "observation_state.npy"), np.asarray(robot_state, dtype=np.float32))
+    np.save(os.path.join(trial_dir, "first_action_chunk_raw.npy"), np.asarray(raw_action_chunk, dtype=np.float32))
+    np.save(
+        os.path.join(trial_dir, "first_action_chunk_clipped.npy"),
+        np.asarray(clipped_action_chunk, dtype=np.float32),
+    )
+
+    stats = {
+        "clip_count": int(clip_count),
+        "max_abs_before_clip": float(max_abs_before_clip),
+        "raw_chunk_shape": list(np.asarray(raw_action_chunk).shape),
+        "clipped_chunk_shape": list(np.asarray(clipped_action_chunk).shape),
+    }
+    with open(os.path.join(trial_dir, "stats.json"), "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    return trial_dir
 
 
 def quat2axisangle(quat):

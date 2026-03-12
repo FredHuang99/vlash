@@ -58,14 +58,23 @@ from vlash.policies.factory import get_policy_class
 from vlash.eval.libero_utils import (
     build_libero_model_obs,
     get_libero_dummy_action,
+    get_libero_debug_images,
     get_libero_env,
     get_libero_images,
     quat2axisangle,
+    save_alignment_debug_artifacts,
     save_rollout_video,
 )
 
 logger = getLogger(__name__)
 VALID_INFERENCE_MODES = {"none", "rtc", "vlash", "rtc_vlash"}
+OFFICIAL_MAX_STEPS = {
+    "libero_spatial": 220,
+    "libero_object": 280,
+    "libero_goal": 300,
+    "libero_10": 520,
+    "libero_90": 400,
+}
 
 
 def _str_to_bool(value: str) -> bool:
@@ -184,7 +193,7 @@ def _validate_runtime_cfg(cfg: LiberoEvalConfig) -> None:
         raise ValueError("rtc_prefix_k must be >= 0")
     if cfg.vlash_delay_k < 0:
         raise ValueError("vlash_delay_k must be >= 0")
-    if cfg.max_steps <= 0:
+    if cfg.max_steps is not None and cfg.max_steps <= 0:
         raise ValueError("max_steps must be > 0")
     if cfg.warmup_steps < 0:
         raise ValueError("warmup_steps must be >= 0")
@@ -192,6 +201,12 @@ def _validate_runtime_cfg(cfg: LiberoEvalConfig) -> None:
         raise ValueError("num_trials_per_task must be > 0")
     if cfg.resolution <= 0:
         raise ValueError("resolution must be > 0")
+    if cfg.env_render_resolution <= 0:
+        raise ValueError("env_render_resolution must be > 0")
+    if cfg.replan_steps <= 0:
+        raise ValueError("replan_steps must be > 0")
+    if cfg.env_seed < 0:
+        raise ValueError("env_seed must be >= 0")
 
 
 def _build_inference_meta(cfg: LiberoEvalConfig, old_chunk: np.ndarray | None, k: int) -> dict:
@@ -225,7 +240,7 @@ def _env_check_success(env) -> bool:
     return False
 
 
-def _sanitize_libero_action(action, model_family: str) -> np.ndarray:
+def _sanitize_libero_action(action, model_family: str) -> tuple[np.ndarray, bool, float]:
     """Keep actions finite and within robosuite's normalized control range."""
     expected_action = np.asarray(get_libero_dummy_action(model_family), dtype=np.float32)
     action = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -246,10 +261,11 @@ def _sanitize_libero_action(action, model_family: str) -> np.ndarray:
             "Policy emitted non-finite LIBERO action %s; falling back to dummy no-op action.",
             action,
         )
-        return expected_action.copy()
+        return expected_action.copy(), True, float("inf")
 
     max_abs_before_clip = float(np.max(np.abs(action)))
     clipped = np.clip(action, -1.0, 1.0)
+    was_clipped = not np.allclose(action, clipped, atol=1e-6)
     # Tiny excursions like 1.0001 are usually just floating-point/unnormalization noise.
     # Only surface a warning when the action is meaningfully outside robosuite's range.
     if max_abs_before_clip > 1.01:
@@ -257,7 +273,49 @@ def _sanitize_libero_action(action, model_family: str) -> np.ndarray:
             "Clipped LIBERO action outside [-1, 1]; max_abs_before_clip=%.4f",
             max_abs_before_clip,
         )
-    return clipped.astype(np.float32, copy=False)
+    return clipped.astype(np.float32, copy=False), was_clipped, max_abs_before_clip
+
+
+def _resolve_max_steps(task_suite: str, override_max_steps: int | None) -> int:
+    """Use the official openpi suite budget unless the caller explicitly overrides it."""
+    if override_max_steps is not None:
+        return int(override_max_steps)
+    if task_suite not in OFFICIAL_MAX_STEPS:
+        raise ValueError(
+            f"Unknown task suite '{task_suite}' with no official max_steps mapping. "
+            "Set max_steps explicitly in the config or CLI."
+        )
+    return int(OFFICIAL_MAX_STEPS[task_suite])
+
+
+def _truncate_sync_replan_window(action_chunk: np.ndarray, replan_steps: int) -> tuple[np.ndarray, int]:
+    """Keep the full chunk for conditioning, but only execute the first replan window before replanning."""
+    chunk = _to_action_chunk(action_chunk)
+    if chunk is None:
+        raise RuntimeError("Worker returned invalid action chunk shape")
+    if chunk.shape[0] < replan_steps:
+        raise RuntimeError(
+            f"Policy predicted only {chunk.shape[0]} steps, but LIBERO sync eval wants at least {replan_steps}"
+        )
+    return chunk, int(replan_steps)
+
+
+def _collect_chunk_clip_stats(action_chunk: np.ndarray, model_family: str) -> tuple[np.ndarray, int, float]:
+    """Summarize how much clipping the first executed action chunk needs."""
+    clipped_actions = []
+    clip_count = 0
+    max_abs_before_clip = 0.0
+    for action in np.asarray(action_chunk, dtype=np.float32):
+        clipped, was_clipped, max_abs = _sanitize_libero_action(action, model_family)
+        clipped_actions.append(clipped)
+        clip_count += int(was_clipped)
+        max_abs_before_clip = max(max_abs_before_clip, max_abs)
+    return np.stack(clipped_actions, axis=0), clip_count, max_abs_before_clip
+
+
+def _should_dump_alignment_debug(cfg: LiberoEvalConfig, episode_idx: int) -> bool:
+    """Keep debug output small: dump only the first trial per task when enabled."""
+    return bool(cfg.debug_alignment and episode_idx == 0)
 
 
 @contextmanager
@@ -503,6 +561,7 @@ def _apply_cli_overrides(cfg: LiberoEvalConfig, cli_overrides: dict | None) -> N
 def eval_libero(config_path: str, cli_overrides: dict | None = None):
     """Main evaluation loop."""
     cfg = _load_eval_config(config_path, cli_overrides)
+    resolved_max_steps = _resolve_max_steps(cfg.task_suite, cfg.max_steps)
 
     tmp.set_start_method("spawn", force=True)
 
@@ -525,6 +584,9 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
         benchmark_dict = benchmark.get_benchmark_dict()
         task_suite = benchmark_dict[cfg.task_suite]()
         num_tasks_in_suite = task_suite.n_tasks
+        debug_root = os.path.join(cfg.local_log_dir, "alignment_debug")
+        if cfg.debug_alignment:
+            os.makedirs(debug_root, exist_ok=True)
 
         logger.info(f"Task suite: {cfg.task_suite} ({num_tasks_in_suite} tasks)")
         logger.info(
@@ -535,6 +597,20 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
             cfg.async_wait,
             cfg.async_threshold,
         )
+        logger.info(
+            "LIBERO eval settings: resolution=%d, env_render_resolution=%d, replan_steps=%d, warmup_steps=%d, "
+            "max_steps=%d%s, env_seed=%d, async_mode=%s",
+            cfg.resolution,
+            cfg.env_render_resolution,
+            cfg.replan_steps,
+            cfg.warmup_steps,
+            resolved_max_steps,
+            " (official default)" if cfg.max_steps is None else " (explicit override)",
+            cfg.env_seed,
+            cfg.async_mode,
+        )
+        if cfg.debug_alignment:
+            logger.info("Alignment debug bundles will be written to %s", debug_root)
 
         total_episodes = 0
         total_successes = 0
@@ -545,7 +621,11 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
         for task_id in range(num_tasks_in_suite):
             task = task_suite.get_task(task_id)
             initial_states = _get_task_init_states(task_suite, task_id)
-            env, task_description = get_libero_env(task, cfg.policy.type, resolution=cfg.resolution)
+            env, task_description = get_libero_env(
+                task,
+                render_resolution=cfg.env_render_resolution,
+                seed=cfg.env_seed,
+            )
 
             task_episodes = 0
             task_successes = 0
@@ -570,6 +650,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 # Host-side chunk state (old chunk + current unexecuted index k).
                 current_chunk = None
                 current_k = 0
+                current_window_end = 0
 
                 inference_pending = False
                 inference_start_time = 0.0
@@ -580,11 +661,16 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 pending_activation_frame = -1
 
                 episode_idle_steps = 0
+                episode_clip_count = 0
+                episode_replans = 0
+                episode_max_abs_action = 0.0
                 done = False
+                debug_saved = False
+                debug_request_snapshot = None
 
-                pbar = tqdm.tqdm(total=cfg.max_steps)
+                pbar = tqdm.tqdm(total=resolved_max_steps)
 
-                while t < cfg.max_steps + cfg.warmup_steps:
+                while t < resolved_max_steps + cfg.warmup_steps:
                     # 1. Warmup simulation
                     if t < cfg.warmup_steps:
                         obs, reward, done, info = env.step(get_libero_dummy_action(cfg.policy.type))
@@ -609,27 +695,61 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
 
                     current_model_obs = build_libero_model_obs(img_dict, robot_state, cfg.policy)
                     remaining_actions = _remaining_actions(current_chunk, current_k)
+                    sync_window_remaining = max(0, int(current_window_end - current_k))
 
                     # 3. Trigger async inference.
                     if cfg.async_mode and not inference_pending and remaining_actions <= cfg.async_threshold:
                         request_meta = _build_inference_meta(cfg, current_chunk, current_k)
                         parent_conn.send((current_model_obs, task_description, request_meta))
+                        episode_replans += 1
                         inference_pending = True
                         inference_start_time = time.time()
                         inference_request_frame = effective_t
+                        if _should_dump_alignment_debug(cfg, episode_idx) and not debug_saved:
+                            debug_request_snapshot = {
+                                "images": get_libero_debug_images(obs, cfg.resolution),
+                                "state": robot_state.copy(),
+                            }
 
-                    # Sync fallback: when queue runs dry, request and wait immediately.
-                    if not cfg.async_mode and remaining_actions == 0:
+                    # Sync fallback: request a fresh chunk every replan window, matching openpi's cadence.
+                    if not cfg.async_mode and sync_window_remaining == 0:
                         request_meta = _build_inference_meta(cfg, current_chunk, current_k)
+                        sync_request_start = time.time()
                         parent_conn.send((current_model_obs, task_description, request_meta))
+                        episode_replans += 1
+                        if _should_dump_alignment_debug(cfg, episode_idx) and not debug_saved:
+                            debug_request_snapshot = {
+                                "images": get_libero_debug_images(obs, cfg.resolution),
+                                "state": robot_state.copy(),
+                            }
                         sync_chunk = parent_conn.recv()
                         if isinstance(sync_chunk, Exception):
                             raise sync_chunk
-                        current_chunk = _to_action_chunk(sync_chunk)
-                        if current_chunk is None:
-                            raise RuntimeError("Worker returned invalid action chunk shape")
+                        all_inference_latencies.append(time.time() - sync_request_start)
+                        current_chunk, current_window_end = _truncate_sync_replan_window(sync_chunk, cfg.replan_steps)
                         current_k = 0
                         remaining_actions = _remaining_actions(current_chunk, current_k)
+                        if debug_request_snapshot is not None and not debug_saved:
+                            debug_chunk = current_chunk[:current_window_end]
+                            clipped_chunk, chunk_clip_count, chunk_max_abs = _collect_chunk_clip_stats(
+                                debug_chunk,
+                                cfg.policy.type,
+                            )
+                            debug_dir = save_alignment_debug_artifacts(
+                                debug_root=debug_root,
+                                task_id=task_id,
+                                trial_idx=episode_idx,
+                                task_description=task_description,
+                                debug_images=debug_request_snapshot["images"],
+                                robot_state=debug_request_snapshot["state"],
+                                raw_action_chunk=debug_chunk,
+                                clipped_action_chunk=clipped_chunk,
+                                clip_count=chunk_clip_count,
+                                max_abs_before_clip=chunk_max_abs,
+                            )
+                            logger.info("Saved alignment debug bundle to %s", debug_dir)
+                            debug_saved = True
+                            debug_request_snapshot = None
 
                     # 4. Check async inference completion.
                     if inference_pending and parent_conn.poll():
@@ -651,6 +771,7 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                         z = effective_t - inference_request_frame
                         if z >= cfg.async_wait:
                             current_chunk = new_chunk
+                            current_window_end = int(new_chunk.shape[0])
                             current_k = min(max(int(z), 0), int(new_chunk.shape[0]))
                             pending_new_chunk = None
                             pending_new_start_idx = 0
@@ -659,18 +780,50 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                             pending_new_chunk = new_chunk
                             pending_new_start_idx = min(int(cfg.async_wait), int(new_chunk.shape[0]))
                             pending_activation_frame = inference_request_frame + int(cfg.async_wait)
+                        if debug_request_snapshot is not None and not debug_saved:
+                            debug_chunk = new_chunk[: min(cfg.replan_steps, int(new_chunk.shape[0]))]
+                            clipped_chunk, chunk_clip_count, chunk_max_abs = _collect_chunk_clip_stats(
+                                debug_chunk,
+                                cfg.policy.type,
+                            )
+                            debug_dir = save_alignment_debug_artifacts(
+                                debug_root=debug_root,
+                                task_id=task_id,
+                                trial_idx=episode_idx,
+                                task_description=task_description,
+                                debug_images=debug_request_snapshot["images"],
+                                robot_state=debug_request_snapshot["state"],
+                                raw_action_chunk=debug_chunk,
+                                clipped_action_chunk=clipped_chunk,
+                                clip_count=chunk_clip_count,
+                                max_abs_before_clip=chunk_max_abs,
+                            )
+                            logger.info("Saved alignment debug bundle to %s", debug_dir)
+                            debug_saved = True
+                            debug_request_snapshot = None
 
                     # 5. Activate deferred chunk if wait window reached.
                     if pending_new_chunk is not None and effective_t >= pending_activation_frame:
                         current_chunk = pending_new_chunk
+                        current_window_end = int(pending_new_chunk.shape[0])
                         current_k = min(pending_new_start_idx, int(pending_new_chunk.shape[0]))
                         pending_new_chunk = None
                         pending_new_start_idx = 0
                         pending_activation_frame = -1
 
                     # 6. Execute action.
-                    if _remaining_actions(current_chunk, current_k) > 0:
-                        action = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
+                    can_execute_action = (
+                        _remaining_actions(current_chunk, current_k) > 0
+                        if cfg.async_mode
+                        else current_chunk is not None and current_k < current_window_end
+                    )
+                    if can_execute_action:
+                        action, was_clipped, max_abs_before_clip = _sanitize_libero_action(
+                            current_chunk[current_k],
+                            cfg.policy.type,
+                        )
+                        episode_clip_count += int(was_clipped)
+                        episode_max_abs_action = max(episode_max_abs_action, max_abs_before_clip)
                         current_k += 1
                         obs, reward, done, info = env.step(action)
                     else:
@@ -707,6 +860,8 @@ def eval_libero(config_path: str, cli_overrides: dict | None = None):
                 trial_summary = (
                     f"Task {task_id} | Trial {episode_idx + 1}/{cfg.num_trials_per_task} | "
                     f"Success: {episode_success} | Idle Steps: {episode_idle_steps} | "
+                    f"Replans: {episode_replans} | Clip Count: {episode_clip_count} | "
+                    f"Max |Action|: {episode_max_abs_action:.4f} | "
                     f"Trial Time: {_format_duration_s(trial_duration_s)}"
                 )
                 print(trial_summary)
@@ -768,8 +923,22 @@ if __name__ == "__main__":
     arg_parser.add_argument("--task_suite", type=str, default=None, help="Override task suite")
     arg_parser.add_argument("--num_trials_per_task", type=int, default=None, help="Override episodes per task")
     arg_parser.add_argument("--resolution", type=int, default=None, help="Override image resolution")
+    arg_parser.add_argument(
+        "--env_render_resolution",
+        type=int,
+        default=None,
+        help="Override LIBERO env camera render resolution before resize/pad",
+    )
     arg_parser.add_argument("--max_steps", type=int, default=None, help="Override max environment steps")
     arg_parser.add_argument("--warmup_steps", type=int, default=None, help="Override warmup steps")
+    arg_parser.add_argument("--replan_steps", type=int, default=None, help="Override sync replanning window")
+    arg_parser.add_argument("--env_seed", type=int, default=None, help="Override LIBERO environment seed")
+    arg_parser.add_argument(
+        "--debug_alignment",
+        type=_str_to_bool,
+        default=None,
+        help="Dump alignment debug artifacts for the first trial of each task",
+    )
     arg_parser.add_argument("--local_log_dir", type=str, default=None, help="Override log directory")
     arg_parser.add_argument("--async_mode", type=_str_to_bool, default=None, help="Enable async evaluation")
     arg_parser.add_argument("--async_threshold", type=int, default=None, help="Override async threshold")
@@ -789,8 +958,12 @@ if __name__ == "__main__":
         "task_suite": args.task_suite,
         "num_trials_per_task": args.num_trials_per_task,
         "resolution": args.resolution,
+        "env_render_resolution": args.env_render_resolution,
         "max_steps": args.max_steps,
         "warmup_steps": args.warmup_steps,
+        "replan_steps": args.replan_steps,
+        "env_seed": args.env_seed,
+        "debug_alignment": args.debug_alignment,
         "local_log_dir": args.local_log_dir,
         "async_mode": args.async_mode,
         "async_threshold": args.async_threshold,

@@ -33,8 +33,12 @@ class LiberoEvalConfig:
     task_suite: str = "libero_spatial"
     num_trials_per_task: int = 20
     resolution: int = 224
-    max_steps: int = 600
+    env_render_resolution: int = 256
+    max_steps: int | None = None
     warmup_steps: int = 10
+    replan_steps: int = 5
+    env_seed: int = 7
+    debug_alignment: bool = False
     local_log_dir: str = "./experiments/logs"
 
     # Async scheduling controls
@@ -97,10 +101,16 @@ class LiberoEvalConfig:
             raise ValueError("num_trials_per_task must be > 0")
         if self.resolution <= 0:
             raise ValueError("resolution must be > 0")
-        if self.max_steps <= 0:
+        if self.env_render_resolution <= 0:
+            raise ValueError("env_render_resolution must be > 0")
+        if self.max_steps is not None and self.max_steps <= 0:
             raise ValueError("max_steps must be > 0")
         if self.warmup_steps < 0:
             raise ValueError("warmup_steps must be >= 0")
+        if self.replan_steps <= 0:
+            raise ValueError("replan_steps must be > 0")
+        if self.env_seed < 0:
+            raise ValueError("env_seed must be >= 0")
         if self.async_threshold < 0:
             raise ValueError("async_threshold must be >= 0")
         if self.async_wait < 0:
@@ -114,4 +124,3 @@ class LiberoEvalConfig:
     def __get_path_fields__(cls) -> list[str]:
         """Enable draccus parser to load policy from path."""
         return ["policy"]
-

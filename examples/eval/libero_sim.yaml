@@ -13,8 +13,13 @@ policy:
 task_suite: libero_spatial
 num_trials_per_task: 20
 resolution: 224
-max_steps: 600
+env_render_resolution: 256
+# Keep null to use openpi's official suite-specific max step budget.
+max_steps: null
 warmup_steps: 10
+replan_steps: 5
+env_seed: 7
+debug_alignment: false
 local_log_dir: /workspace/outputs/eval_outputs
 
 # Async scheduling controls
