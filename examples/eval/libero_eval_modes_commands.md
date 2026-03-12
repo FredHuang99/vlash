@@ -1,5 +1,7 @@
 # LIBERO Four-Mode Evaluation Commands
 
+Follow `C:/vlas/vlash/examples/eval/libero_setup.md` once before running these commands.
+
 Set `policy.path` in `C:/vlas/vlash/examples/eval/libero_sim.yaml` to your checkpoint first.
 
 ## 1. No RTC + No VLASH

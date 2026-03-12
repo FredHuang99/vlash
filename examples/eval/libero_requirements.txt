@@ -1,0 +1,9 @@
+# Extra packages for running VLASH with LIBERO.
+# Modeled on OpenVLA's LIBERO setup, plus VLASH's direct OpenCV dependency.
+imageio[ffmpeg]
+robosuite==1.4.1
+bddl
+easydict
+cloudpickle
+gym
+opencv-python==4.11.0.86

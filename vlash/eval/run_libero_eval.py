@@ -29,7 +29,18 @@ import numpy as np
 import torch
 import torch.multiprocessing as tmp
 import tqdm
-from libero.libero import benchmark
+
+try:
+    from libero.libero import benchmark
+except ModuleNotFoundError as exc:
+    if exc.name != "libero":
+        raise
+    raise ModuleNotFoundError(
+        "LIBERO is not installed in the current Python environment. "
+        "Install LIBERO with `python -m pip install -e /path/to/LIBERO`, then install "
+        "VLASH's extra LIBERO dependencies with "
+        "`python -m pip install -r /path/to/vlash/examples/eval/libero_requirements.txt`."
+    ) from exc
 
 from lerobot.configs import parser as config_parser
 from lerobot.utils.utils import get_safe_torch_device

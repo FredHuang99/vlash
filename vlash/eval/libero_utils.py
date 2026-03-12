@@ -19,8 +19,19 @@ import cv2
 
 import imageio
 import numpy as np
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+
+try:
+    from libero.libero import get_libero_path
+    from libero.libero.envs import OffScreenRenderEnv
+except ModuleNotFoundError as exc:
+    if exc.name != "libero":
+        raise
+    raise ModuleNotFoundError(
+        "LIBERO is not installed in the current Python environment. "
+        "Install LIBERO with `python -m pip install -e /path/to/LIBERO`, then install "
+        "VLASH's extra LIBERO dependencies with "
+        "`python -m pip install -r /path/to/vlash/examples/eval/libero_requirements.txt`."
+    ) from exc
 
 
 def get_libero_env(task, model_family, resolution=224):
