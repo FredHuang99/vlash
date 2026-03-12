@@ -46,6 +46,30 @@ from torch.utils.data._utils.collate import default_collate
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+def _map_prev_action_to_state(prev_action: torch.Tensor, target_state_dim: int) -> torch.Tensor:
+    """Map previous action to target state dimension using truncation or tail padding.
+
+    Rules:
+    - action_dim > state_dim: take prev_action[:state_dim]
+    - action_dim < state_dim: pad zeros at the end
+    - action_dim == state_dim: passthrough
+    """
+    if prev_action.dim() != 1:
+        raise ValueError(f"Expected 1D prev_action, got shape {tuple(prev_action.shape)}")
+
+    action_dim = prev_action.shape[0]
+    if action_dim > target_state_dim:
+        return prev_action[:target_state_dim]
+    if action_dim < target_state_dim:
+        pad = torch.zeros(
+            target_state_dim - action_dim,
+            dtype=prev_action.dtype,
+            device=prev_action.device,
+        )
+        return torch.cat([prev_action, pad], dim=0)
+    return prev_action
+
+
 class VLASHDataset(LeRobotDataset):
     """Dataset with temporal delay augmentation for VLASH training.
     
@@ -92,8 +116,9 @@ class VLASHDataset(LeRobotDataset):
             max_delay_steps: Maximum temporal delay for augmentation.
         """
         self.max_delay_steps = max_delay_steps
-        # When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
-        # This is required for LIBERO where state_dim != action_dim.
+        # Kept for backward compatibility with old configs.
+        # Ground-truth future state is intentionally disabled to keep
+        # training and inference semantics aligned.
         self.use_state_ground_truth = use_state_ground_truth
 
         super().__init__(
@@ -158,9 +183,10 @@ class VLASHDataset(LeRobotDataset):
     def __getitem__(self, idx) -> dict:
         """Get sample with state constructed from previous action.
         
-        When offset > 0, the observation.state is replaced with the
-        action from the previous timestep (t + offset - 1). This matches
-        the semantics of nano-lerobot's apply_async_offset.
+        When offset > 0, observation.state is replaced with the previous
+        action (a_{t+offset-1}) mapped to state_dim:
+        - action_dim > state_dim: truncate
+        - action_dim < state_dim: tail pad zeros
         
         Args:
             idx: Sample index.
@@ -184,31 +210,20 @@ class VLASHDataset(LeRobotDataset):
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        if self.use_state_ground_truth:
-            # Use recorded future state s_{t+offset}
-            future_idx = max(ep_start, min(ep_end - 1, idx + offset))
-            new_state = self.hf_dataset[future_idx]["observation.state"]
-        else:
-            # Use previous action a_{t+offset-1} as proxy future state
-            prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-            obs_state = item["observation.state"]
-            prev_action = self.hf_dataset[prev_idx]["action"]
+        # Use previous action a_{t+offset-1} as proxy future state.
+        prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+        obs_state = item["observation.state"]
+        prev_action = self.hf_dataset[prev_idx]["action"]
 
-            # Validate dimensions
-            if obs_state.dim() != 1 or prev_action.dim() != 1:
-                raise ValueError("For now only support 1D state/action.")
+        # Validate dimensions
+        if obs_state.dim() != 1 or prev_action.dim() != 1:
+            raise ValueError(
+                "Expected 1D state/action when applying async offset: "
+                f"state_shape={tuple(obs_state.shape)}, action_shape={tuple(prev_action.shape)}"
+            )
 
-            state_dim = obs_state.shape[0]
-            action_dim = prev_action.shape[0]
-
-            if state_dim == action_dim:
-                new_state = prev_action
-            else:
-                raise ValueError(
-                    f"Unsupported state_dim != action_dim combination "
-                    "in VLASHDataset when applying async offset to observation.state. "
-                    "For LIBERO, set use_state_ground_truth=True."
-                )
+        state_dim = obs_state.shape[0]
+        new_state = _map_prev_action_to_state(prev_action, state_dim)
 
         item["observation.state"] = new_state
         item["delay_steps"] = torch.tensor(offset, dtype=torch.long)
@@ -348,29 +363,19 @@ class SharedObservationVLASHDataset(VLASHDataset):
             if offset == 0:
                 state = base_item["observation.state"]
             else:
-                if self.use_state_ground_truth:
-                    future_idx = max(ep_start, min(ep_end - 1, idx + offset))
-                    state = self.hf_dataset[future_idx]["observation.state"]
-                else:
-                    # State is previous action (action at t + offset - 1)
-                    prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
-                    prev_action = self.hf_dataset[prev_idx]["action"]
-                    
-                    obs_state = base_item["observation.state"]
-                    if obs_state.dim() != 1 or prev_action.dim() != 1:
-                        raise ValueError("For now only support 1D state/action.")
-                    
-                    state_dim = obs_state.shape[0]
-                    action_dim = prev_action.shape[0]
-                    
-                    if state_dim == action_dim:
-                        state = prev_action
-                    else:
-                        raise ValueError(
-                            f"Unsupported state_dim != action_dim combination "
-                            "in SharedObservationVLASHDataset when applying async offset. "
-                            "For LIBERO, set use_state_ground_truth=True."
-                        )
+                # State is previous action (action at t + offset - 1) mapped to state_dim.
+                prev_idx = max(ep_start, min(ep_end - 1, idx + offset - 1))
+                prev_action = self.hf_dataset[prev_idx]["action"]
+
+                obs_state = base_item["observation.state"]
+                if obs_state.dim() != 1 or prev_action.dim() != 1:
+                    raise ValueError(
+                        "Expected 1D state/action when applying async offset: "
+                        f"state_shape={tuple(obs_state.shape)}, action_shape={tuple(prev_action.shape)}"
+                    )
+
+                state_dim = obs_state.shape[0]
+                state = _map_prev_action_to_state(prev_action, state_dim)
             states.append(state)
             
             # Get actions for this offset

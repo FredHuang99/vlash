@@ -72,9 +72,9 @@ max_delay_steps: 8
 # observation embeddings instead of randomly sampling one offset per sample
 shared_observation: true
 
-# When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
-# This solves the state_dim != action_dim crash for the LIBERO environment.
-use_state_ground_truth: true
+# Deprecated/disabled: training now always maps previous action -> state_dim
+# (truncate or tail-zero-pad) to match inference semantics.
+use_state_ground_truth: false
 
 # RTC prefix mask: during training, randomly sample prefix steps from
 # [0, max_prefix_mask_steps] per batch. The first K steps are forced to

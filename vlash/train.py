@@ -141,6 +141,14 @@ def make_vlash_dataset(cfg: VLASHTrainConfig):
     Returns:
         VLASHDataset or SharedObservationVLASHDataset: Dataset instance.
     """
+    if cfg.use_state_ground_truth:
+        raise ValueError(
+            "use_state_ground_truth=True is no longer supported.\n"
+            "Training now always aligns with inference semantics by constructing "
+            "offset states from previous actions with truncation/tail-zero-padding.\n"
+            "Please set use_state_ground_truth=false in your train config."
+        )
+
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )

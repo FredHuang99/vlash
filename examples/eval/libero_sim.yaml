@@ -1,0 +1,36 @@
+# VLASH LIBERO Simulation Evaluation Config
+# This config is simulation-only and does not require a robot section.
+
+policy:
+  # Fill your policy checkpoint path.
+  path: <path to the policy checkpoint>
+  device: cuda
+  compile_model: true
+  fuse_qkv: true
+  fuse_gate_up: true
+
+# LIBERO benchmark settings
+task_suite: libero_spatial
+num_trials_per_task: 20
+resolution: 224
+max_steps: 600
+warmup_steps: 10
+local_log_dir: ./experiments/logs/libero_sim
+
+# Async scheduling controls
+async_mode: true
+async_threshold: 20
+async_wait: 5
+
+# Conditioning mode:
+#   none      -> no RTC prefix, no VLASH state replacement
+#   rtc       -> RTC prefix only
+#   vlash     -> VLASH state replacement only
+#   rtc_vlash -> enable both RTC and VLASH
+inference_mode: rtc_vlash
+
+# Boundary semantics at inference trigger (k is unexecuted index):
+#   RTC prefix window: [k, k + rtc_prefix_k - 1]
+#   VLASH state index: k + vlash_delay_k - 1
+rtc_prefix_k: 4
+vlash_delay_k: 1

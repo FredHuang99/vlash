@@ -107,8 +107,9 @@ class VLASHTrainConfig(TrainPipelineConfig):
     # Cross-offset attention.
     shared_observation: bool = False
 
-    # When True, offset state uses recorded future state s_{t+offset} instead of action proxy.
-    # This is required for LIBERO where state_dim != action_dim.
+    # Deprecated and disabled. Kept for backward compatibility only.
+    # Training now always builds offset state from previous action using
+    # truncation/tail-zero-padding to match inference semantics.
     use_state_ground_truth: bool = False
 
     # LoRA configuration

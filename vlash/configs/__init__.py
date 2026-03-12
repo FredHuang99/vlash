@@ -20,6 +20,7 @@ This module provides configuration classes for VLASH training and inference:
 """
 
 from vlash.configs.run_config import RunConfig
+from vlash.configs.libero_eval_config import LiberoEvalConfig
 from vlash.configs.train_config import VLASHTrainConfig
 from vlash.policies.pi05 import PI05Config
 from vlash.policies.pi0 import PI0Config
@@ -32,4 +33,4 @@ from lerobot.configs.policies import PreTrainedConfig as _LRPreTrainedConfig
 _LRPreTrainedConfig._choice_registry["pi05"] = PI05Config
 _LRPreTrainedConfig._choice_registry["pi0"] = PI0Config
 
-__all__ = ["RunConfig", "VLASHTrainConfig", "PI05Config", "PI0Config"]
+__all__ = ["RunConfig", "LiberoEvalConfig", "VLASHTrainConfig", "PI05Config", "PI0Config"]
