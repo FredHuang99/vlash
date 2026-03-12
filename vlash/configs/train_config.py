@@ -96,6 +96,11 @@ class VLASHTrainConfig(TrainPipelineConfig):
     # Gradient accumulation steps
     grad_accum_steps: int = 1
 
+    # DataLoader settings. These are exposed so recipes can tune I/O
+    # throughput for different CPU / GPU topologies without code changes.
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = True
+
     # Shared observation optimization: train all offsets together with shared
     # observation (images + language). This provides ~(max_delay_steps+1)x speedup
     # by computing observation embeddings only once and using custom attention

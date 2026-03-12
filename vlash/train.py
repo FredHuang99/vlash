@@ -28,6 +28,7 @@ Usage:
 import logging
 import sys
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
@@ -71,6 +72,38 @@ from vlash.lora import (
     load_lora_adapters,
 )
 from vlash.policies.factory import make_policy
+
+
+def _to_python_scalar(value: Any) -> float | int | bool:
+    """Convert Tensor / array scalars to plain Python values for logging."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().item()
+        return value.detach().float().mean().item()
+
+    if hasattr(value, "item") and not isinstance(value, (bool, int, float)):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(value, (bool, int, float)):
+        return value
+
+    raise TypeError(f"Unsupported metric value type for logging: {type(value)!r}")
+
+
+def _average_output_dicts(output_dicts: list[dict[str, Any]]) -> dict[str, float]:
+    """Average scalar model outputs across micro-steps in one optimizer step."""
+    totals: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+
+    for output_dict in output_dicts:
+        for key, value in output_dict.items():
+            totals[key] += float(_to_python_scalar(value))
+            counts[key] += 1
+
+    return {key: totals[key] / counts[key] for key in totals}
 
 
 def make_vlash_dataset(cfg: VLASHTrainConfig):
@@ -426,6 +459,7 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
     # === Log Training Configuration ===
     num_learnable_params = count_parameters(policy, only_trainable=True)
     num_total_params = count_parameters(policy, only_trainable=False)
+    use_shared_observation = cfg.shared_observation and cfg.max_delay_steps > 0
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
@@ -434,14 +468,31 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
-        
-        # Calculate effective batch size across all GPUs and accumulation steps
+
+        # Calculate optimizer batch sizes across all GPUs and accumulation steps.
         num_processes = accelerator.num_processes
-        micro_bs = cfg.batch_size * num_processes
-        effective_bs = micro_bs * cfg.grad_accum_steps
+        global_micro_batch = cfg.batch_size * num_processes
+        global_optimizer_batch = global_micro_batch * cfg.grad_accum_steps
         logging.info(
-            f"Effective batch size (per optimizer step): "
-            f"{cfg.batch_size} x {num_processes} x {cfg.grad_accum_steps} = {effective_bs}"
+            f"Global micro batch (per forward pass): "
+            f"{cfg.batch_size} x {num_processes} = {global_micro_batch}"
+        )
+        logging.info(
+            f"Global optimizer batch (without shared-offset expansion): "
+            f"{global_micro_batch} x {cfg.grad_accum_steps} = {global_optimizer_batch}"
+        )
+        if use_shared_observation:
+            approx_upper_bound = global_optimizer_batch * (cfg.max_delay_steps + 1)
+            logging.info(
+                "Approx. upper bound on supervised chunk targets per optimizer step "
+                f"with shared observation: {global_optimizer_batch} x {cfg.max_delay_steps + 1} "
+                f"= {approx_upper_bound}"
+            )
+        logging.info(
+            f"DataLoader workers: {cfg.num_workers} per process "
+            f"({cfg.num_workers * num_processes} total), "
+            f"prefetch_factor={cfg.dataloader_prefetch_factor}, "
+            f"persistent_workers={cfg.dataloader_persistent_workers and cfg.num_workers > 0}"
         )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
@@ -461,7 +512,6 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
         sampler = None
 
     # Use custom collate function for shared observation dataset
-    use_shared_observation = cfg.shared_observation and cfg.max_delay_steps > 0
     collate_fn = shared_observation_collate_fn if use_shared_observation else None
 
     dataloader = torch.utils.data.DataLoader(
@@ -472,7 +522,8 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=cfg.dataloader_prefetch_factor if cfg.num_workers > 0 else None,
+        persistent_workers=cfg.dataloader_persistent_workers if cfg.num_workers > 0 else False,
         collate_fn=collate_fn,
     )
 
@@ -492,6 +543,7 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "data_wait_frac": AverageMeter("wait", ":.3f"),
     }
 
     # MetricsTracker handles epoch calculation and averaging
@@ -511,13 +563,16 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         # Track compute time for the full gradient accumulation window
         step_compute_time = 0.0
+        step_dataloading_time = 0.0
+        micro_step_losses: list[float] = []
+        micro_step_output_dicts: list[dict[str, Any]] = []
 
         # Gradient accumulation: accumulate gradients over multiple micro-batches
         for micro_step in range(cfg.grad_accum_steps):
             # Measure data loading time
             start_time = time.perf_counter()
             batch = next(dl_iter)
-            train_tracker.dataloading_s = time.perf_counter() - start_time
+            step_dataloading_time += time.perf_counter() - start_time
 
             # Only step optimizer on the last micro-batch
             do_step = micro_step == cfg.grad_accum_steps - 1
@@ -537,14 +592,24 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
                 use_shared_observation=use_shared_observation,
             )
             step_compute_time += time.perf_counter() - compute_start
+            micro_step_losses.append(train_tracker.loss)
+            if output_dict:
+                micro_step_output_dicts.append(output_dict)
 
-        # Record total compute time for this optimizer step
+        # Record step-level metrics aggregated across the full accumulation window.
+        train_tracker.loss = sum(micro_step_losses) / len(micro_step_losses)
         train_tracker.update_s = step_compute_time
+        train_tracker.dataloading_s = step_dataloading_time
+        total_step_time = step_compute_time + step_dataloading_time
+        train_tracker.data_wait_frac = (
+            step_dataloading_time / total_step_time if total_step_time > 0 else 0.0
+        )
+        output_dict = _average_output_dicts(micro_step_output_dicts)
 
         # Increment step counter after optimizer update
         step += 1
         train_tracker.step()
-        
+
         # Determine if this step requires logging or checkpointing
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
@@ -554,7 +619,9 @@ def train(cfg: VLASHTrainConfig, accelerator: Accelerator | None = None):
             logging.info(train_tracker)
             if wandb_logger:
                 # Get window-averaged metrics from tracker
-                wandb_log_dict = train_tracker.to_dict()
+                wandb_log_dict = {
+                    key: _to_python_scalar(value) for key, value in train_tracker.to_dict().items()
+                }
 
                 # Merge model-specific outputs (e.g., auxiliary losses)
                 if output_dict:

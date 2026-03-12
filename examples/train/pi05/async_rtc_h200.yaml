@@ -16,44 +16,50 @@ policy:
 
 # Dataset configuration
 dataset:
-  repo_id: dummy/dummy
+  repo_id: lerobot/libero_spatial_image
   video_backend: torchcodec
   # To use a local dataset, set root to the local path:
   root: /workspace/datasets/lerobot_libero_spatial
 
 # Training parameters
-output_dir: /workspace/outputs/rtc_vlash
+output_dir: /workspace/outputs/rtc_vlash_h200
 job_name: pi05_rtc_vlash_h200
-batch_size: 16
-steps: 5000
-num_workers: 8
+batch_size: 8
+steps: 30000
+num_workers: 12
+dataloader_prefetch_factor: 2
+dataloader_persistent_workers: true
 seed: 1000
 
-# Optimizer configuration (matched to RTC paper recommendations)
+# Optimizer configuration
+# Keep the PI0.5 LIBERO-base learning-rate scale and RTC/VLASH beta pair.
+# With only 2 GPUs, we recover the same 32-sample global optimizer batch via
+# moderate accumulation instead of jumping to the 512 batch regime from the RTC
+# robot paper, which is too large for this VLA fine-tuning setup.
 use_policy_training_preset: false
 optimizer:
   type: adamw
-  lr: 5.0e-5
+  lr: 2.5e-5
   betas: [0.9, 0.95]
   weight_decay: 1.0e-2
 
 # Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 100
-  peak_lr: 5.0e-5
+  num_warmup_steps: 1000
+  peak_lr: 2.5e-5
   decay_lr: 2.5e-6
-  num_decay_steps: 5000
+  num_decay_steps: 30000
 
 # Checkpointing
 save_checkpoint: true
-save_freq: 1000
+save_freq: 5000
 
 # Logging
 log_freq: 50
 wandb:
   enable: true
-  project: rtc_vlash_h200
+  project: rtc_vlash
   entity: null
   disable_artifact: true
 
@@ -79,8 +85,8 @@ use_state_ground_truth: true
 # the prefix per item in each batch has been forced to equal with the actual delay steps per item
 # making this parameter useless
 
-# Gradient accumulation for larger effective batch size
-# Effective batch = batch_size * grad_accum_steps * num_gpus
-# For 2x H200: 16 * 16 * 2 = 512 (matches RTC paper)
-# For 4x A100: 16 * 8 * 4 = 512
-grad_accum_steps: 16 # 512 // batch_size // num_gpus
+# Gradient accumulation
+# For 2x H200: 8 x 2 x 2 = 32 global samples per optimizer step before shared
+# observation expands offsets. This matches the A800 recipe while keeping the
+# per-GPU micro-batch large enough for H200 throughput.
+grad_accum_steps: 2

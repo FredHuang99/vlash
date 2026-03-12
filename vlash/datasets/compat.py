@@ -21,10 +21,71 @@ Import this module before importing lerobot to apply patches.
 
 import json
 import logging
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
 import packaging.version
+
+
+_ACTIVE_LOCAL_DATASET_ROOT: ContextVar[Path | None] = ContextVar(
+    "vlash_active_local_dataset_root", default=None
+)
+
+
+def _looks_like_lerobot_dataset_dir(path: Path) -> bool:
+    """Best-effort check for a local LeRobot dataset directory."""
+    if not path.exists() or not path.is_dir():
+        return False
+
+    markers = [
+        path / "meta" / "info.json",
+        path / "meta" / "episodes.jsonl",
+        path / "meta" / "tasks.jsonl",
+        path / "data",
+        path / "videos",
+    ]
+    return any(marker.exists() for marker in markers)
+
+
+def _resolve_existing_local_dataset_root(root: str | Path | None, repo_id: str | None) -> Path | None:
+    """Resolve a local dataset directory from the provided root hint."""
+    if root is None:
+        return None
+
+    candidates = [Path(root)]
+    if repo_id:
+        candidates.append(Path(root) / repo_id)
+
+    for candidate in candidates:
+        if _looks_like_lerobot_dataset_dir(candidate):
+            return candidate
+
+    return None
+
+
+def _wrap_dataset_init_with_local_root_context(original_init):
+    """Expose the local dataset root to patched_get_safe_version during init."""
+
+    @wraps(original_init)
+    def wrapped(self, *args, **kwargs):
+        repo_id = kwargs.get("repo_id")
+        if repo_id is None and len(args) >= 1:
+            repo_id = args[0]
+
+        root = kwargs.get("root")
+        if root is None and len(args) >= 2:
+            root = args[1]
+
+        local_root = _resolve_existing_local_dataset_root(root, repo_id)
+        token = _ACTIVE_LOCAL_DATASET_ROOT.set(local_root)
+        try:
+            return original_init(self, *args, **kwargs)
+        finally:
+            _ACTIVE_LOCAL_DATASET_ROOT.reset(token)
+
+    return wrapped
 
 
 def patched_check_version(repo_id, version_to_check, current_version, enforce_breaking_major=True):
@@ -50,6 +111,15 @@ def patched_get_safe_version(repo_id: str, revision: str | None) -> str:
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION
     import requests
     
+    local_root = _ACTIVE_LOCAL_DATASET_ROOT.get()
+    if local_root is not None:
+        logging.info(
+            "Using local dataset root %s for %s; skipping Hugging Face refs query.",
+            local_root,
+            repo_id,
+        )
+        return revision or "main"
+
     api = HfApi()
     
     # Attempt to fetch from Hugging Face Hub; fallback gracefully for local offline datasets
@@ -309,7 +379,11 @@ def apply_patches():
     meta_cls = dataset_module.LeRobotDatasetMetadata
     meta_cls.get_data_file_path = make_patched_path_method(meta_cls.get_data_file_path, for_video=False)
     meta_cls.get_video_file_path = make_patched_path_method(meta_cls.get_video_file_path, for_video=True)
-    
+    meta_cls.__init__ = _wrap_dataset_init_with_local_root_context(meta_cls.__init__)
+
+    dataset_cls = dataset_module.LeRobotDataset
+    dataset_cls.__init__ = _wrap_dataset_init_with_local_root_context(dataset_cls.__init__)
+
     logging.info("VLASH: Applied v2.1 compatibility patches to lerobot")
 
 
