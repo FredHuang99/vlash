@@ -3,7 +3,7 @@
 
 policy:
   # Fill your policy checkpoint path.
-  path: <path to the policy checkpoint>
+  path: /workspace/models/pi0.5_libero_base
   device: cuda
   compile_model: true
   fuse_qkv: true
@@ -11,14 +11,14 @@ policy:
 
 # LIBERO benchmark settings
 task_suite: libero_spatial
-num_trials_per_task: 20
+num_trials_per_task: 10
 resolution: 224
 max_steps: 600
 warmup_steps: 10
-local_log_dir: ./experiments/logs/libero_sim
+local_log_dir: /workspace/outputs/eval_outputs
 
 # Async scheduling controls
-async_mode: true
+async_mode: false
 async_threshold: 20
 async_wait: 5
 
@@ -27,10 +27,10 @@ async_wait: 5
 #   rtc       -> RTC prefix only
 #   vlash     -> VLASH state replacement only
 #   rtc_vlash -> enable both RTC and VLASH
-inference_mode: rtc_vlash
+inference_mode: none
 
 # Boundary semantics at inference trigger (k is unexecuted index):
 #   RTC prefix window: [k, k + rtc_prefix_k - 1]
 #   VLASH state index: k + vlash_delay_k - 1
 rtc_prefix_k: 4
-vlash_delay_k: 1
+vlash_delay_k: 4
