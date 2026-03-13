@@ -14,6 +14,7 @@ The benchmark:
 - treats run `1` as warmup
 - averages runs `2-4`
 - measures the wall-clock time from the first executed policy action to the completed `250`th policy action
+- if one LIBERO trial ends before reaching the requested action budget, starts a fresh trial segment and keeps timing
 - uses `async_wait=10` to simulate communication delay
 - prints the per-run results and final averages directly to stdout
 - supports a safer single-scenario mode via `--scenario`
