@@ -16,7 +16,9 @@
 """Benchmark async-vs-non-async LIBERO rollout latency without changing eval semantics."""
 
 import argparse
+import json
 import multiprocessing as mp
+import os
 import time
 from dataclasses import asdict, dataclass
 from logging import getLogger
@@ -91,11 +93,77 @@ SCENARIOS = (
         trigger_steps=20,
     ),
 )
+CASE1_SCENARIO_NAME = "case1_blocking_full_chunk"
 
 
 def _format_seconds(seconds: float) -> str:
     """Format a wall-clock duration for concise console output."""
     return f"{seconds:.3f}s"
+
+
+def _build_scenarios(case2_trigger_steps: int, case3_trigger_steps: int) -> dict[str, ScenarioSpec]:
+    """Build scenario map with CLI-overridden async trigger thresholds."""
+    scenarios = (
+        SCENARIOS[0],
+        ScenarioSpec(
+            name=SCENARIOS[1].name,
+            description=SCENARIOS[1].description,
+            mode=SCENARIOS[1].mode,
+            trigger_steps=case2_trigger_steps,
+        ),
+        ScenarioSpec(
+            name=SCENARIOS[2].name,
+            description=SCENARIOS[2].description,
+            mode=SCENARIOS[2].mode,
+            trigger_steps=case3_trigger_steps,
+        ),
+    )
+    return {scenario.name: scenario for scenario in scenarios}
+
+
+def _resolve_baseline_json_path(cfg, baseline_json: str | None) -> str:
+    """Resolve the optional case1 baseline file path."""
+    if baseline_json:
+        return baseline_json
+    return os.path.join(cfg.local_log_dir, "libero_async_latency_case1_baseline.json")
+
+
+def _write_case1_baseline(path: str, scenario_result: dict, *, cfg, task_id: int, init_state_idx: int) -> None:
+    """Persist case1 summary for later case2/case3 speedup comparison."""
+    baseline_dir = os.path.dirname(path)
+    if baseline_dir:
+        os.makedirs(baseline_dir, exist_ok=True)
+    payload = {
+        "scenario_name": scenario_result["name"],
+        "avg_e2e_seconds": float(scenario_result["avg_e2e_seconds"]),
+        "avg_steps_per_second": float(scenario_result["avg_steps_per_second"]),
+        "benchmark_steps": int(scenario_result["benchmark_steps"]),
+        "num_repeats": int(scenario_result["num_repeats"]),
+        "async_wait": int(scenario_result["async_wait"]),
+        "task_suite": cfg.task_suite,
+        "task_id": int(task_id),
+        "init_state_idx": int(init_state_idx),
+        "policy_path": str(getattr(cfg.policy, "pretrained_path", "")),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"  Wrote {CASE1_SCENARIO_NAME} baseline to {path}")
+
+
+def _load_case1_baseline(path: str) -> dict:
+    """Load previously persisted case1 summary."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Baseline file not found: {path}. Run --scenario {CASE1_SCENARIO_NAME} first to create it."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("scenario_name") != CASE1_SCENARIO_NAME:
+        raise ValueError(
+            f"Baseline file {path} does not contain {CASE1_SCENARIO_NAME}; "
+            f"found {payload.get('scenario_name')!r} instead."
+        )
+    return payload
 
 
 def _build_current_model_obs(obs: dict, cfg) -> dict:
@@ -476,6 +544,8 @@ def benchmark_libero_async_latency(
     async_wait: int,
     case2_trigger_steps: int,
     case3_trigger_steps: int,
+    scenario_name: str,
+    baseline_json: str | None,
 ):
     """Benchmark three LIBERO scheduling scenarios and compare e2e rollout latency."""
     if benchmark_steps <= 0:
@@ -491,22 +561,15 @@ def benchmark_libero_async_latency(
 
     cfg = _load_eval_config(config_path)
     tmp.set_start_method("spawn", force=True)
-
-    # Override the async trigger thresholds just for this benchmark's scenario definitions.
-    scenarios = (
-        SCENARIOS[0],
-        ScenarioSpec(
-            name=SCENARIOS[1].name,
-            description=SCENARIOS[1].description,
-            mode=SCENARIOS[1].mode,
-            trigger_steps=case2_trigger_steps,
-        ),
-        ScenarioSpec(
-            name=SCENARIOS[2].name,
-            description=SCENARIOS[2].description,
-            mode=SCENARIOS[2].mode,
-            trigger_steps=case3_trigger_steps,
-        ),
+    scenarios_by_name = _build_scenarios(case2_trigger_steps, case3_trigger_steps)
+    valid_scenarios = {"all", *scenarios_by_name.keys()}
+    if scenario_name not in valid_scenarios:
+        raise ValueError(f"scenario must be one of {sorted(valid_scenarios)}, got {scenario_name!r}")
+    baseline_path = _resolve_baseline_json_path(cfg, baseline_json)
+    selected_scenarios = (
+        tuple(scenarios_by_name.values())
+        if scenario_name == "all"
+        else (scenarios_by_name[scenario_name],)
     )
 
     parent_conn, child_conn = mp.Pipe()
@@ -555,7 +618,16 @@ def benchmark_libero_async_latency(
         }
 
         baseline_avg = None
-        for scenario in scenarios:
+        if scenario_name != "all" and scenario_name != CASE1_SCENARIO_NAME:
+            baseline_payload = _load_case1_baseline(baseline_path)
+            baseline_avg = float(baseline_payload["avg_e2e_seconds"])
+            print(
+                f"Loaded {CASE1_SCENARIO_NAME} baseline from {baseline_path}: "
+                f"avg_e2e={_format_seconds(baseline_avg)}, "
+                f"avg_steps/s={baseline_payload['avg_steps_per_second']:.2f}"
+            )
+
+        for scenario in selected_scenarios:
             scenario_result = _run_scenario(
                 cfg=cfg,
                 parent_conn=parent_conn,
@@ -570,9 +642,17 @@ def benchmark_libero_async_latency(
             )
             results["scenarios"][scenario.name] = scenario_result
 
-            if baseline_avg is None:
+            if scenario.name == CASE1_SCENARIO_NAME:
                 baseline_avg = scenario_result["avg_e2e_seconds"]
-            else:
+                if scenario_name != "all":
+                    _write_case1_baseline(
+                        baseline_path,
+                        scenario_result,
+                        cfg=cfg,
+                        task_id=task_id,
+                        init_state_idx=init_state_idx,
+                    )
+            elif baseline_avg is not None:
                 speedup = float(baseline_avg / scenario_result["avg_e2e_seconds"])
                 scenario_result["speedup_vs_case1_blocking_full_chunk"] = speedup
                 print(
@@ -585,6 +665,7 @@ def benchmark_libero_async_latency(
         print(f"  Task id: {results['task_id']}")
         print(f"  Init state idx: {results['init_state_idx']}")
         print(f"  Policy path: {results['policy_path']}")
+        print(f"  Scenario mode: {scenario_name}")
         for scenario_name, scenario_result in results["scenarios"].items():
             print(
                 f"  {scenario_name}: avg_e2e={_format_seconds(scenario_result['avg_e2e_seconds'])}, "
@@ -609,6 +690,12 @@ def benchmark_libero_async_latency(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark LIBERO async-vs-non-async rollout latency")
     parser.add_argument("--config", type=str, required=True, help="Path to LIBERO eval config YAML")
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="all",
+        help="Scenario to run: all, case1_blocking_full_chunk, case2_async_after_10, or case3_async_after_20",
+    )
     parser.add_argument("--task_id", type=int, default=0, help="LIBERO task index to benchmark")
     parser.add_argument("--init_state_idx", type=int, default=0, help="Initial state index for the benchmark task")
     parser.add_argument(
@@ -631,6 +718,15 @@ def main():
         default=20,
         help="Steps executed before launching async inference in case3",
     )
+    parser.add_argument(
+        "--baseline_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional case1 baseline file path. In single-scenario mode, case1 writes this file and "
+            "case2/case3 read it to compute speedup."
+        ),
+    )
     args = parser.parse_args()
 
     benchmark_libero_async_latency(
@@ -642,6 +738,8 @@ def main():
         async_wait=args.async_wait,
         case2_trigger_steps=args.case2_trigger_steps,
         case3_trigger_steps=args.case3_trigger_steps,
+        scenario_name=args.scenario,
+        baseline_json=args.baseline_json,
     )
 
 
