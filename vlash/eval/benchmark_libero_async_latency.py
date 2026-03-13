@@ -194,6 +194,18 @@ def _make_benchmark_env(task, cfg):
     )
 
 
+def _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx: int):
+    """Start a completely fresh episode by recreating the LIBERO env."""
+    if env is not None and hasattr(env, "close"):
+        try:
+            env.close()
+        except Exception:
+            pass
+    env, _ = _make_benchmark_env(task, cfg)
+    obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
+    return env, obs
+
+
 def _step_benchmark_env(env, action, initial_states, init_state_idx: int, task, cfg):
     """Step LIBERO once and auto-reset if the episode has already terminated.
 
@@ -282,10 +294,10 @@ def _run_benchmark_once(
     no-op steps still consume wall-clock time, but they do not count toward the
     250 executed policy actions.
     """
-    env, _ = _make_benchmark_env(task, cfg)
+    env = None
 
     try:
-        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
+        env, obs = _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx)
 
         warmup_env_steps = 0
         while warmup_env_steps < cfg.warmup_steps:
@@ -432,14 +444,21 @@ def _run_benchmark_once(
             if episode_reset:
                 if reset_occurred:
                     resets += 1
+                if inference_pending:
+                    _drain_inflight_worker_result(parent_conn, wait_for_result=True)
+                    inference_pending = False
+                else:
+                    _drain_inflight_worker_result(parent_conn, wait_for_result=False)
+                stale_pending_result = False
+                request_kind = ""
+                request_sim_step = 0
+                env, obs = _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx)
                 current_chunk = None
                 current_k = 0
                 pending_new_chunk = None
                 pending_new_start_idx = 0
                 pending_activation_step = -1
                 request_sent_for_current_chunk = False
-                if inference_pending:
-                    stale_pending_result = True
 
         e2e_seconds = time.perf_counter() - start_time
         if inference_pending:
