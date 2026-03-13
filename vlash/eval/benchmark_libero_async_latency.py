@@ -33,6 +33,7 @@ from vlash.eval.libero_utils import (
 )
 from vlash.eval.run_libero_eval import (
     _build_inference_meta,
+    _env_check_success,
     _get_task_init_states,
     _load_eval_config,
     _sanitize_libero_action,
@@ -116,6 +117,33 @@ def _reset_env_to_init_state(env, initial_states, init_state_idx: int):
     return env.set_init_state(initial_states[init_state_idx])
 
 
+def _step_benchmark_env(env, action, initial_states, init_state_idx: int):
+    """Step LIBERO once and auto-reset if the episode has already terminated.
+
+    The formal eval loop treats both `done` and `check_success()` as terminal.
+    Benchmark runs should do the same; otherwise a later no-op wait step can hit
+    robosuite's "executing action in terminated episode" guard.
+    """
+    try:
+        obs, _, done, _ = env.step(action)
+    except ValueError as exc:
+        if "executing action in terminated episode" not in str(exc):
+            raise
+
+        logger.warning(
+            "Benchmark hit a terminated LIBERO episode before the next step; resetting to the fixed init state."
+        )
+        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
+        return obs, True, True, False
+
+    episode_finished = bool(done or _env_check_success(env))
+    if episode_finished:
+        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
+        return obs, True, True, True
+
+    return obs, False, False, True
+
+
 def _send_inference_request(parent_conn, cfg, current_chunk, current_k: int, current_model_obs: dict, task_desc: str):
     """Send one inference request to the shared worker process."""
     request_meta = _build_inference_meta(cfg, current_chunk, current_k)
@@ -172,10 +200,16 @@ def _run_benchmark_once(
     """
     obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
 
-    for _ in range(cfg.warmup_steps):
-        obs, _, done, _ = env.step(get_libero_dummy_action(cfg.policy.type))
-        if done:
-            obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
+    warmup_env_steps = 0
+    while warmup_env_steps < cfg.warmup_steps:
+        obs, _, _, step_executed = _step_benchmark_env(
+            env,
+            get_libero_dummy_action(cfg.policy.type),
+            initial_states,
+            init_state_idx,
+        )
+        if step_executed:
+            warmup_env_steps += 1
 
     initial_model_obs = _build_current_model_obs(obs, cfg)
     _send_inference_request(parent_conn, cfg, None, 0, initial_model_obs, task_description)
@@ -282,17 +316,29 @@ def _run_benchmark_once(
         can_execute_chunk_action = current_chunk is not None and current_k < int(current_chunk.shape[0])
         if can_execute_chunk_action:
             action, _, _ = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
-            current_k += 1
-            obs, _, done, _ = env.step(action)
-            executed_action_steps += 1
+            obs, episode_reset, reset_occurred, step_executed = _step_benchmark_env(
+                env,
+                action,
+                initial_states,
+                init_state_idx,
+            )
+            if step_executed:
+                current_k += 1
+                executed_action_steps += 1
         else:
-            obs, _, done, _ = env.step(get_libero_dummy_action(cfg.policy.type))
+            obs, episode_reset, reset_occurred, step_executed = _step_benchmark_env(
+                env,
+                get_libero_dummy_action(cfg.policy.type),
+                initial_states,
+                init_state_idx,
+            )
 
-        sim_step_index += 1
+        if step_executed:
+            sim_step_index += 1
 
-        if done:
-            obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
-            resets += 1
+        if episode_reset:
+            if reset_occurred:
+                resets += 1
             current_chunk = None
             current_k = 0
             pending_new_chunk = None
