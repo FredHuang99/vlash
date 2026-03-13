@@ -59,9 +59,10 @@ class ScenarioSpec:
 class RunMetrics:
     e2e_seconds: float
     steps_per_second: float
+    executed_action_steps: int
     env_steps_total: int
-    num_resets: int
     inference_requests: int
+    ended_early: bool
 
 
 SCENARIOS = (
@@ -194,52 +195,6 @@ def _make_benchmark_env(task, cfg):
     )
 
 
-def _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx: int):
-    """Start a completely fresh episode by recreating the LIBERO env."""
-    if env is not None and hasattr(env, "close"):
-        try:
-            env.close()
-        except Exception:
-            pass
-    env, _ = _make_benchmark_env(task, cfg)
-    obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
-    return env, obs
-
-
-def _step_benchmark_env(env, action, initial_states, init_state_idx: int, task, cfg):
-    """Step LIBERO once and auto-reset if the episode has already terminated.
-
-    The formal eval loop treats both `done` and `check_success()` as terminal.
-    Benchmark runs should do the same; otherwise a later no-op wait step can hit
-    robosuite's "executing action in terminated episode" guard.
-    """
-    try:
-        obs, _, done, _ = env.step(action)
-    except ValueError as exc:
-        if "executing action in terminated episode" not in str(exc):
-            raise
-
-        logger.warning(
-            "Benchmark hit a terminated LIBERO episode before the next step; recreating the env and resetting "
-            "to the fixed init state."
-        )
-        if hasattr(env, "close"):
-            try:
-                env.close()
-            except Exception:
-                pass
-        env, _ = _make_benchmark_env(task, cfg)
-        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
-        return env, obs, True, True, False
-
-    episode_finished = bool(done or _env_check_success(env))
-    if episode_finished:
-        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
-        return env, obs, True, True, True
-
-    return env, obs, False, False, True
-
-
 def _send_inference_request(parent_conn, cfg, current_chunk, current_k: int, current_model_obs: dict, task_desc: str):
     """Send one inference request to the shared worker process."""
     request_meta = _build_inference_meta(cfg, current_chunk, current_k)
@@ -297,20 +252,23 @@ def _run_benchmark_once(
     env = None
 
     try:
-        env, obs = _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx)
+        env, _ = _make_benchmark_env(task, cfg)
+        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
 
-        warmup_env_steps = 0
-        while warmup_env_steps < cfg.warmup_steps:
-            env, obs, _, _, step_executed = _step_benchmark_env(
-                env,
-                get_libero_dummy_action(cfg.policy.type),
-                initial_states,
-                init_state_idx,
-                task,
-                cfg,
-            )
-            if step_executed:
-                warmup_env_steps += 1
+        for _ in range(cfg.warmup_steps):
+            obs, _, done, _ = env.step(get_libero_dummy_action(cfg.policy.type))
+            if done or _env_check_success(env):
+                logger.warning(
+                    "Benchmark warmup ended the LIBERO trial early; stopping this run before timed rollout."
+                )
+                return RunMetrics(
+                    e2e_seconds=0.0,
+                    steps_per_second=0.0,
+                    executed_action_steps=0,
+                    env_steps_total=0,
+                    inference_requests=0,
+                    ended_early=True,
+                )
 
         initial_model_obs = _build_current_model_obs(obs, cfg)
         _send_inference_request(parent_conn, cfg, None, 0, initial_model_obs, task_description)
@@ -320,10 +278,10 @@ def _run_benchmark_once(
 
         executed_action_steps = 0
         sim_step_index = 0
-        resets = 0
         inference_requests = 1
 
         current_chunk, current_k = _activate_chunk(initial_chunk, 0)
+        current_chunk_activation_idx = current_k
         pending_new_chunk = None
         pending_new_start_idx = 0
         pending_activation_step = -1
@@ -332,11 +290,11 @@ def _run_benchmark_once(
         request_sim_step = 0
         request_kind = ""
         request_sent_for_current_chunk = False
-        stale_pending_result = False
+        done = False
+        episode_success = False
+        start_time = None
 
-        start_time = time.perf_counter()
-
-        while executed_action_steps < benchmark_steps:
+        while executed_action_steps < benchmark_steps and not done and not episode_success:
             current_model_obs = _build_current_model_obs(obs, cfg)
             chunk_len = 0 if current_chunk is None else int(current_chunk.shape[0])
 
@@ -363,13 +321,13 @@ def _run_benchmark_once(
                     request_sim_step = sim_step_index
                     request_kind = "blocking"
             else:
-                trigger_at = min(int(scenario.trigger_steps), chunk_len) if chunk_len > 0 else 0
+                executed_since_activation = max(0, int(current_k - current_chunk_activation_idx))
                 if (
                     current_chunk is not None
                     and not request_sent_for_current_chunk
                     and pending_new_chunk is None
                     and not inference_pending
-                    and current_k >= trigger_at
+                    and executed_since_activation >= int(scenario.trigger_steps)
                 ):
                     _send_inference_request(parent_conn, cfg, current_chunk, current_k, current_model_obs, task_description)
                     inference_requests += 1
@@ -384,31 +342,30 @@ def _run_benchmark_once(
                     raise RuntimeError("Worker returned an invalid action chunk shape during benchmark")
 
                 inference_pending = False
-                if stale_pending_result:
-                    stale_pending_result = False
-                    request_kind = ""
-                else:
-                    z = sim_step_index - request_sim_step
-                    if request_kind in {"bootstrap", "blocking"}:
-                        if z >= async_wait:
-                            current_chunk, current_k = _activate_chunk(new_chunk, 0)
-                            request_sent_for_current_chunk = False
-                        else:
-                            pending_new_chunk = new_chunk
-                            pending_new_start_idx = 0
-                            pending_activation_step = request_sim_step + async_wait
+                z = sim_step_index - request_sim_step
+                if request_kind in {"bootstrap", "blocking"}:
+                    if z >= async_wait:
+                        current_chunk, current_k = _activate_chunk(new_chunk, 0)
+                        current_chunk_activation_idx = current_k
+                        request_sent_for_current_chunk = False
                     else:
-                        if z >= async_wait:
-                            current_chunk, current_k = _activate_chunk(new_chunk, z)
-                            request_sent_for_current_chunk = False
-                        else:
-                            pending_new_chunk = new_chunk
-                            pending_new_start_idx = min(async_wait, int(new_chunk.shape[0]))
-                            pending_activation_step = request_sim_step + async_wait
-                    request_kind = ""
+                        pending_new_chunk = new_chunk
+                        pending_new_start_idx = 0
+                        pending_activation_step = request_sim_step + async_wait
+                else:
+                    if z >= async_wait:
+                        current_chunk, current_k = _activate_chunk(new_chunk, z)
+                        current_chunk_activation_idx = current_k
+                        request_sent_for_current_chunk = False
+                    else:
+                        pending_new_chunk = new_chunk
+                        pending_new_start_idx = min(async_wait, int(new_chunk.shape[0]))
+                        pending_activation_step = request_sim_step + async_wait
+                request_kind = ""
 
             if pending_new_chunk is not None and sim_step_index >= pending_activation_step:
                 current_chunk, current_k = _activate_chunk(pending_new_chunk, pending_new_start_idx)
+                current_chunk_activation_idx = current_k
                 pending_new_chunk = None
                 pending_new_start_idx = 0
                 pending_activation_step = -1
@@ -417,61 +374,40 @@ def _run_benchmark_once(
             can_execute_chunk_action = current_chunk is not None and current_k < int(current_chunk.shape[0])
             if can_execute_chunk_action:
                 action, _, _ = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
-                env, obs, episode_reset, reset_occurred, step_executed = _step_benchmark_env(
-                    env,
-                    action,
-                    initial_states,
-                    init_state_idx,
-                    task,
-                    cfg,
-                )
-                if step_executed:
-                    current_k += 1
-                    executed_action_steps += 1
+                if start_time is None:
+                    start_time = time.perf_counter()
+                obs, _, done, _ = env.step(action)
+                current_k += 1
+                executed_action_steps += 1
             else:
-                env, obs, episode_reset, reset_occurred, step_executed = _step_benchmark_env(
-                    env,
-                    get_libero_dummy_action(cfg.policy.type),
-                    initial_states,
-                    init_state_idx,
-                    task,
-                    cfg,
-                )
+                obs, _, done, _ = env.step(get_libero_dummy_action(cfg.policy.type))
 
-            if step_executed:
-                sim_step_index += 1
+            sim_step_index += 1
+            episode_success = bool(done or _env_check_success(env))
 
-            if episode_reset:
-                if reset_occurred:
-                    resets += 1
-                if inference_pending:
-                    _drain_inflight_worker_result(parent_conn, wait_for_result=True)
-                    inference_pending = False
-                else:
-                    _drain_inflight_worker_result(parent_conn, wait_for_result=False)
-                stale_pending_result = False
-                request_kind = ""
-                request_sim_step = 0
-                env, obs = _restart_benchmark_episode(env, task, cfg, initial_states, init_state_idx)
-                current_chunk = None
-                current_k = 0
-                pending_new_chunk = None
-                pending_new_start_idx = 0
-                pending_activation_step = -1
-                request_sent_for_current_chunk = False
-
-        e2e_seconds = time.perf_counter() - start_time
+        e2e_seconds = 0.0 if start_time is None else (time.perf_counter() - start_time)
         if inference_pending:
             _drain_inflight_worker_result(parent_conn, wait_for_result=True)
         else:
             _drain_inflight_worker_result(parent_conn, wait_for_result=False)
 
+        ended_early = bool(executed_action_steps < benchmark_steps)
+        if ended_early:
+            logger.warning(
+                "Benchmark run ended before reaching %d executed policy steps: got %d steps (done=%s, success=%s).",
+                benchmark_steps,
+                executed_action_steps,
+                done,
+                episode_success,
+            )
+
         return RunMetrics(
             e2e_seconds=float(e2e_seconds),
-            steps_per_second=float(benchmark_steps / e2e_seconds),
+            steps_per_second=float(executed_action_steps / e2e_seconds) if e2e_seconds > 0 else 0.0,
+            executed_action_steps=int(executed_action_steps),
             env_steps_total=int(sim_step_index),
-            num_resets=int(resets),
             inference_requests=int(inference_requests),
+            ended_early=ended_early,
         )
     finally:
         if env is not None and hasattr(env, "close"):
@@ -515,8 +451,9 @@ def _run_scenario(
             f"  Run {run_idx + 1}/{num_repeats}{warmup_marker}: "
             f"e2e={_format_seconds(metrics.e2e_seconds)}, "
             f"steps/s={metrics.steps_per_second:.2f}, "
+            f"executed_steps={metrics.executed_action_steps}/{benchmark_steps}, "
             f"env_steps={metrics.env_steps_total}, "
-            f"requests={metrics.inference_requests}, resets={metrics.num_resets}"
+            f"requests={metrics.inference_requests}, ended_early={metrics.ended_early}"
         )
 
     measured_runs = run_metrics[1:] if len(run_metrics) > 1 else run_metrics
