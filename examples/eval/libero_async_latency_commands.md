@@ -6,6 +6,11 @@ This benchmark reuses VLASH's existing LIBERO forward path and compares three sc
 - `case2_async_after_10`
 - `case3_async_after_20`
 
+For `case2` and `case3`, the async scheduling now mirrors `run_libero_eval()`:
+
+- `case2_async_after_10` means async trigger when `remaining_actions <= 10`
+- `case3_async_after_20` means async trigger when `remaining_actions <= 20`
+
 The benchmark:
 
 - runs real LIBERO simulation
@@ -14,7 +19,7 @@ The benchmark:
 - treats run `1` as warmup
 - averages runs `2-4`
 - measures the wall-clock time from the first executed policy action to the completed `250`th policy action
-- if one LIBERO trial ends before reaching the requested action budget, starts a fresh trial segment and keeps timing
+- if one LIBERO trial ends before reaching the requested action budget, keeps the single-trial result and imputes the remaining time from the observed per-step average
 - uses `async_wait=10` to simulate communication delay
 - prints the per-run results and final averages directly to stdout
 - supports a safer single-scenario mode via `--scenario`

@@ -58,6 +58,8 @@ class ScenarioSpec:
 @dataclass
 class RunMetrics:
     e2e_seconds: float
+    raw_e2e_seconds: float
+    imputed_extra_seconds: float
     steps_per_second: float
     executed_action_steps: int
     env_steps_total: int
@@ -79,8 +81,8 @@ SCENARIOS = (
     ScenarioSpec(
         name="case2_async_after_10",
         description=(
-            "Launch async inference after executing 10 steps from the current chunk, keep executing the old "
-            "chunk, then switch with async_wait handover semantics."
+            "Mirror run_libero_eval async mode with remaining-actions threshold=10, then switch with "
+            "async_wait handover semantics."
         ),
         mode="async",
         trigger_steps=10,
@@ -88,8 +90,8 @@ SCENARIOS = (
     ScenarioSpec(
         name="case3_async_after_20",
         description=(
-            "Launch async inference after executing 20 steps from the current chunk, keep executing the old "
-            "chunk, then switch with async_wait handover semantics."
+            "Mirror run_libero_eval async mode with remaining-actions threshold=20, then switch with "
+            "async_wait handover semantics."
         ),
         mode="async",
         trigger_steps=20,
@@ -252,6 +254,19 @@ def _drain_inflight_worker_result(parent_conn, wait_for_result: bool):
             raise RuntimeError("Worker returned an invalid action chunk shape while draining benchmark state")
 
 
+def _estimate_total_e2e(raw_e2e_seconds: float, executed_action_steps: int, benchmark_steps: int) -> tuple[float, float]:
+    """Estimate missing time if a single LIBERO trial ends before the target step budget."""
+    if executed_action_steps <= 0:
+        return float(raw_e2e_seconds), 0.0
+    if executed_action_steps >= benchmark_steps:
+        return float(raw_e2e_seconds), 0.0
+
+    avg_step_time = float(raw_e2e_seconds / executed_action_steps)
+    remaining_steps = int(benchmark_steps - executed_action_steps)
+    imputed_extra_seconds = avg_step_time * remaining_steps
+    return float(raw_e2e_seconds + imputed_extra_seconds), float(imputed_extra_seconds)
+
+
 def _run_benchmark_once(
     cfg,
     parent_conn,
@@ -263,224 +278,196 @@ def _run_benchmark_once(
     async_wait: int,
     scenario: ScenarioSpec,
 ) -> RunMetrics:
-    """Execute one benchmark run by chaining independent LIBERO trials if needed.
+    """Execute one benchmark run using the same single-trial semantics as run_libero_eval()."""
+    env = None
+    inference_pending = False
 
-    Each trial segment uses the same single-trial semantics as run_libero_eval().
-    If a trial ends before we accumulate the requested number of executed policy
-    steps, we start a fresh trial segment and keep the wall-clock timer running.
-    This keeps the benchmark comparable while preserving the eval logic.
-    """
-    total_executed_action_steps = 0
-    total_env_steps = 0
-    total_inference_requests = 0
-    trial_segments = 0
-    start_time = None
-    ended_early = False
-    max_trial_segments = max(8, benchmark_steps * 4)
+    try:
+        env, _ = _make_benchmark_env(task, cfg)
+        obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
 
-    while total_executed_action_steps < benchmark_steps:
-        if trial_segments >= max_trial_segments:
-            ended_early = True
-            logger.warning(
-                "Benchmark exceeded %d trial segments before reaching %d executed policy steps; stopping early at %d steps.",
-                max_trial_segments,
-                benchmark_steps,
-                total_executed_action_steps,
+        for _ in range(cfg.warmup_steps):
+            obs, done, hidden_terminated = _step_single_trial_env(
+                env,
+                get_libero_dummy_action(cfg.policy.type),
+                obs,
             )
-            break
-
-        env = None
-        inference_pending = False
-        try:
-            trial_segments += 1
-            env, _ = _make_benchmark_env(task, cfg)
-            obs = _reset_env_to_init_state(env, initial_states, init_state_idx)
-
-            for _ in range(cfg.warmup_steps):
-                obs, done, hidden_terminated = _step_single_trial_env(
-                    env,
-                    get_libero_dummy_action(cfg.policy.type),
-                    obs,
+            if done or hidden_terminated or _env_check_success(env):
+                logger.warning(
+                    "Benchmark warmup ended the LIBERO trial early; stopping this run before timed rollout."
                 )
-                if start_time is not None:
-                    total_env_steps += 1
-                if done or hidden_terminated or _env_check_success(env):
-                    logger.warning(
-                        "Benchmark trial segment %d ended during warmup; restarting with a fresh trial.",
-                        trial_segments,
-                    )
-                    break
-            else:
-                initial_model_obs = _build_current_model_obs(obs, cfg)
-                _send_inference_request(parent_conn, cfg, None, 0, initial_model_obs, task_description)
-                initial_chunk = _receive_worker_chunk(parent_conn)
-                if initial_chunk is None:
-                    raise RuntimeError("Worker returned an invalid initial action chunk shape during benchmark")
-                total_inference_requests += 1
+                return RunMetrics(
+                    e2e_seconds=0.0,
+                    raw_e2e_seconds=0.0,
+                    imputed_extra_seconds=0.0,
+                    steps_per_second=0.0,
+                    executed_action_steps=0,
+                    env_steps_total=0,
+                    inference_requests=0,
+                    trial_segments=1,
+                    ended_early=True,
+                )
 
-                current_chunk, current_k = _activate_chunk(initial_chunk, 0)
-                current_chunk_activation_idx = current_k
-                pending_new_chunk = None
-                pending_new_start_idx = 0
-                pending_activation_step = -1
-                inference_pending = False
-                request_sim_step = 0
-                request_kind = ""
+        initial_model_obs = _build_current_model_obs(obs, cfg)
+        _send_inference_request(parent_conn, cfg, None, 0, initial_model_obs, task_description)
+        initial_chunk = _receive_worker_chunk(parent_conn)
+        if initial_chunk is None:
+            raise RuntimeError("Worker returned an invalid initial action chunk shape during benchmark")
+
+        executed_action_steps = 0
+        env_steps_total = 0
+        inference_requests = 1
+
+        current_chunk = initial_chunk
+        current_k = 0
+        current_window_end = int(initial_chunk.shape[0])
+
+        pending_new_chunk = None
+        pending_new_start_idx = 0
+        pending_activation_step = -1
+
+        inference_pending = False
+        inference_request_step = 0
+        request_sent_for_current_chunk = False
+        current_chunk_activation_idx = 0
+
+        done = False
+        episode_success = False
+        hidden_terminated = False
+        start_time = None
+
+        while executed_action_steps < benchmark_steps and not done and not episode_success and not hidden_terminated:
+            current_model_obs = _build_current_model_obs(obs, cfg)
+            remaining_actions = 0 if current_chunk is None else max(0, int(current_chunk.shape[0] - current_k))
+            sync_window_remaining = max(0, int(current_window_end - current_k))
+
+            if scenario.mode != "async" and sync_window_remaining == 0:
+                sync_request_start = time.time()
+                request_meta = _build_inference_meta(cfg, current_chunk, current_k)
+                parent_conn.send((current_model_obs, task_description, request_meta))
+                inference_requests += 1
+                sync_chunk = parent_conn.recv()
+                if isinstance(sync_chunk, Exception):
+                    raise sync_chunk
+                current_chunk = _to_action_chunk(sync_chunk)
+                if current_chunk is None:
+                    raise RuntimeError("Worker returned invalid action chunk shape during benchmark")
+                current_window_end = int(current_chunk.shape[0])
+                current_k = 0
+                current_chunk_activation_idx = 0
                 request_sent_for_current_chunk = False
-                done = False
-                episode_success = False
-                hidden_terminated = False
-                trial_sim_step_index = 0
+                _ = time.time() - sync_request_start
 
-                while (
-                    total_executed_action_steps < benchmark_steps
-                    and not done
-                    and not episode_success
-                    and not hidden_terminated
-                ):
-                    current_model_obs = _build_current_model_obs(obs, cfg)
-                    chunk_len = 0 if current_chunk is None else int(current_chunk.shape[0])
+            if scenario.mode == "async":
+                async_threshold = int(scenario.trigger_steps)
 
-                    if current_chunk is None and pending_new_chunk is None and not inference_pending:
-                        _send_inference_request(
-                            parent_conn,
-                            cfg,
-                            current_chunk,
-                            current_k,
-                            current_model_obs,
-                            task_description,
-                        )
-                        total_inference_requests += 1
-                        inference_pending = True
-                        request_sim_step = trial_sim_step_index
-                        request_kind = "bootstrap"
-                    elif scenario.mode == "blocking":
-                        if (
-                            current_chunk is not None
-                            and current_k >= chunk_len
-                            and pending_new_chunk is None
-                            and not inference_pending
-                        ):
-                            _send_inference_request(
-                                parent_conn,
-                                cfg,
-                                current_chunk,
-                                current_k,
-                                current_model_obs,
-                                task_description,
-                            )
-                            total_inference_requests += 1
-                            inference_pending = True
-                            request_sim_step = trial_sim_step_index
-                            request_kind = "blocking"
-                    else:
-                        executed_since_activation = max(0, int(current_k - current_chunk_activation_idx))
-                        if (
-                            current_chunk is not None
-                            and not request_sent_for_current_chunk
-                            and pending_new_chunk is None
-                            and not inference_pending
-                            and executed_since_activation >= int(scenario.trigger_steps)
-                        ):
-                            _send_inference_request(
-                                parent_conn,
-                                cfg,
-                                current_chunk,
-                                current_k,
-                                current_model_obs,
-                                task_description,
-                            )
-                            total_inference_requests += 1
-                            inference_pending = True
-                            request_sim_step = trial_sim_step_index
-                            request_kind = "async"
-                            request_sent_for_current_chunk = True
+                if not inference_pending and remaining_actions <= async_threshold:
+                    request_meta = _build_inference_meta(cfg, current_chunk, current_k)
+                    parent_conn.send((current_model_obs, task_description, request_meta))
+                    inference_requests += 1
+                    inference_pending = True
+                    inference_request_step = env_steps_total
+                    request_sent_for_current_chunk = True
 
-                    if inference_pending and parent_conn.poll():
-                        new_chunk = _receive_worker_chunk(parent_conn)
-                        if new_chunk is None:
-                            raise RuntimeError("Worker returned an invalid action chunk shape during benchmark")
+                if inference_pending and parent_conn.poll():
+                    new_chunk = parent_conn.recv()
+                    if isinstance(new_chunk, Exception):
+                        raise new_chunk
 
-                        inference_pending = False
-                        z = trial_sim_step_index - request_sim_step
-                        if request_kind in {"bootstrap", "blocking"}:
-                            if z >= async_wait:
-                                current_chunk, current_k = _activate_chunk(new_chunk, 0)
-                                current_chunk_activation_idx = current_k
-                                request_sent_for_current_chunk = False
-                            else:
-                                pending_new_chunk = new_chunk
-                                pending_new_start_idx = 0
-                                pending_activation_step = request_sim_step + async_wait
-                        else:
-                            if z >= async_wait:
-                                current_chunk, current_k = _activate_chunk(new_chunk, z)
-                                current_chunk_activation_idx = current_k
-                                request_sent_for_current_chunk = False
-                            else:
-                                pending_new_chunk = new_chunk
-                                pending_new_start_idx = min(async_wait, int(new_chunk.shape[0]))
-                                pending_activation_step = request_sim_step + async_wait
-                        request_kind = ""
+                    new_chunk = _to_action_chunk(new_chunk)
+                    if new_chunk is None:
+                        raise RuntimeError("Worker returned invalid action chunk shape during benchmark")
 
-                    if pending_new_chunk is not None and trial_sim_step_index >= pending_activation_step:
-                        current_chunk, current_k = _activate_chunk(pending_new_chunk, pending_new_start_idx)
+                    inference_pending = False
+                    z = env_steps_total - inference_request_step
+                    if z >= async_wait:
+                        current_chunk = new_chunk
+                        current_window_end = int(new_chunk.shape[0])
+                        current_k = min(max(int(z), 0), int(new_chunk.shape[0]))
                         current_chunk_activation_idx = current_k
                         pending_new_chunk = None
                         pending_new_start_idx = 0
                         pending_activation_step = -1
                         request_sent_for_current_chunk = False
-
-                    can_execute_chunk_action = current_chunk is not None and current_k < int(current_chunk.shape[0])
-                    if can_execute_chunk_action:
-                        action, _, _ = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
-                        if start_time is None:
-                            start_time = time.perf_counter()
-                        obs, done, hidden_terminated = _step_single_trial_env(env, action, obs)
-                        current_k += 1
-                        total_executed_action_steps += 1
                     else:
-                        obs, done, hidden_terminated = _step_single_trial_env(
-                            env,
-                            get_libero_dummy_action(cfg.policy.type),
-                            obs,
-                        )
+                        pending_new_chunk = new_chunk
+                        pending_new_start_idx = min(int(async_wait), int(new_chunk.shape[0]))
+                        pending_activation_step = inference_request_step + int(async_wait)
 
-                    if start_time is not None:
-                        total_env_steps += 1
-                    trial_sim_step_index += 1
-                    episode_success = bool(done or _env_check_success(env))
+                if pending_new_chunk is not None and env_steps_total >= pending_activation_step:
+                    current_chunk = pending_new_chunk
+                    current_window_end = int(pending_new_chunk.shape[0])
+                    current_k = min(pending_new_start_idx, int(pending_new_chunk.shape[0]))
+                    current_chunk_activation_idx = current_k
+                    pending_new_chunk = None
+                    pending_new_start_idx = 0
+                    pending_activation_step = -1
+                    request_sent_for_current_chunk = False
 
-            if inference_pending:
-                _drain_inflight_worker_result(parent_conn, wait_for_result=True)
+            can_execute_action = (
+                max(0, int(current_chunk.shape[0] - current_k)) > 0
+                if scenario.mode == "async"
+                else current_chunk is not None and current_k < current_window_end
+            )
+            if can_execute_action:
+                action, _, _ = _sanitize_libero_action(current_chunk[current_k], cfg.policy.type)
+                if start_time is None:
+                    start_time = time.perf_counter()
+                obs, done, hidden_terminated = _step_single_trial_env(env, action, obs)
+                current_k += 1
+                executed_action_steps += 1
             else:
-                _drain_inflight_worker_result(parent_conn, wait_for_result=False)
-        finally:
-            if env is not None and hasattr(env, "close"):
-                try:
-                    env.close()
-                except Exception:
-                    pass
+                obs, done, hidden_terminated = _step_single_trial_env(
+                    env,
+                    get_libero_dummy_action(cfg.policy.type),
+                    obs,
+                )
 
-    e2e_seconds = 0.0 if start_time is None else (time.perf_counter() - start_time)
-    ended_early = bool(ended_early or total_executed_action_steps < benchmark_steps)
-    if ended_early:
-        logger.warning(
-            "Benchmark run finished early: reached %d/%d executed policy steps across %d trial segments.",
-            total_executed_action_steps,
-            benchmark_steps,
-            trial_segments,
+            env_steps_total += 1
+            episode_success = bool(done or _env_check_success(env))
+
+        raw_e2e_seconds = 0.0 if start_time is None else (time.perf_counter() - start_time)
+        e2e_seconds, imputed_extra_seconds = _estimate_total_e2e(
+            raw_e2e_seconds=raw_e2e_seconds,
+            executed_action_steps=executed_action_steps,
+            benchmark_steps=benchmark_steps,
         )
 
-    return RunMetrics(
-        e2e_seconds=float(e2e_seconds),
-        steps_per_second=float(total_executed_action_steps / e2e_seconds) if e2e_seconds > 0 else 0.0,
-        executed_action_steps=int(total_executed_action_steps),
-        env_steps_total=int(total_env_steps),
-        inference_requests=int(total_inference_requests),
-        trial_segments=int(trial_segments),
-        ended_early=ended_early,
-    )
+        if inference_pending:
+            _drain_inflight_worker_result(parent_conn, wait_for_result=True)
+        else:
+            _drain_inflight_worker_result(parent_conn, wait_for_result=False)
+
+        ended_early = bool(executed_action_steps < benchmark_steps)
+        if ended_early:
+            logger.warning(
+                "Benchmark run ended before reaching %d executed policy steps: got %d steps (done=%s, success=%s, hidden_terminated=%s); imputed %.3fs for the remaining %d steps.",
+                benchmark_steps,
+                executed_action_steps,
+                done,
+                episode_success,
+                hidden_terminated,
+                imputed_extra_seconds,
+                benchmark_steps - executed_action_steps,
+            )
+
+        return RunMetrics(
+            e2e_seconds=float(e2e_seconds),
+            raw_e2e_seconds=float(raw_e2e_seconds),
+            imputed_extra_seconds=float(imputed_extra_seconds),
+            steps_per_second=float(benchmark_steps / e2e_seconds) if e2e_seconds > 0 else 0.0,
+            executed_action_steps=int(executed_action_steps),
+            env_steps_total=int(env_steps_total),
+            inference_requests=int(inference_requests),
+            trial_segments=1,
+            ended_early=ended_early,
+        )
+    finally:
+        if env is not None and hasattr(env, "close"):
+            try:
+                env.close()
+            except Exception:
+                pass
 
 
 def _run_scenario(
@@ -516,6 +503,8 @@ def _run_scenario(
         print(
             f"  Run {run_idx + 1}/{num_repeats}{warmup_marker}: "
             f"e2e={_format_seconds(metrics.e2e_seconds)}, "
+            f"raw_e2e={_format_seconds(metrics.raw_e2e_seconds)}, "
+            f"imputed={_format_seconds(metrics.imputed_extra_seconds)}, "
             f"steps/s={metrics.steps_per_second:.2f}, "
             f"executed_steps={metrics.executed_action_steps}/{benchmark_steps}, "
             f"env_steps={metrics.env_steps_total}, "
